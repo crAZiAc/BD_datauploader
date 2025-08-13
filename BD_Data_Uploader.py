@@ -1,11 +1,12 @@
-# bd_uploader_v33.py — cache scoped to connection + live debug logging for GET/POST/PATCH (incl. 204)
+# bd_uploader_v4.py — BlueDolphin uploader with uniq title check, stronger colors, 429 retry, and property filtering
 import json
+import time
 from typing import Dict, List, Tuple
 import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="BlueDolphin Uploader v33", layout="wide")
+st.set_page_config(page_title="BlueDolphin Uploader v4", layout="wide")
 st.title("BlueDolphin CSV/Excel Uploader")
 
 # ---------------- Sidebar: connection + debug ----------------
@@ -19,7 +20,7 @@ with st.sidebar:
     st.divider()
     debug_mode = st.checkbox("Debug mode (log API calls)", value=False)
 
-    # debug storage + live box
+    # Debug storage + live box
     if "debug_log" not in st.session_state:
         st.session_state.debug_log = []
     if "debug_box" not in st.session_state:
@@ -35,14 +36,11 @@ with st.sidebar:
     st.session_state.debug_box.code("\n".join(st.session_state.debug_log) or "(empty)", language="text")
 
 def _dbg(line: str):
-    if not st.session_state.get("debug_log") is None and debug_mode:
+    if debug_mode:
         st.session_state.debug_log.append(line)
-        box = st.session_state.get("debug_box")
-        if box:
-            box.code("\n".join(st.session_state.debug_log), language="text")
+        st.session_state.debug_box.code("\n".join(st.session_state.debug_log), language="text")
 
 def hdr() -> Dict[str, str]:
-    # never log secrets
     return {"tenant": tenant or "", "x-api-key": api_key or "", "Content-Type": "application/json"}
 
 # Clear caches when connection changes (+ button)
@@ -57,97 +55,131 @@ if st.sidebar.button("Reload data (clear cache)"):
     for k in ("preview_df", "preview_meta"):
         st.session_state.pop(k, None)
 
-# -------- unified request with full logging (pre + post, incl. 204) --------
-def _request(method: str, path: str, *, params: Dict=None, body: Dict=None, expect_json: bool=True):
+# -------- unified request with 429 retry & UI-safe toggles --------
+def _request(
+    method: str,
+    path: str,
+    *,
+    params: Dict = None,
+    body: Dict = None,
+    expect_json: bool = True,
+    log: bool = True,
+    ui_errors: bool = True,
+    ui_feedback: bool = True,
+    retry_on_429: bool = True,
+    wait_seconds: int = 20,
+):
+    """Single HTTP helper with:
+       - live debug logging
+       - 429 retry loop with Streamlit countdown
+       - no Streamlit UI when used by cached functions (ui_errors=False, ui_feedback=False)
+    """
     url = f"{API_BASE}{path}"
 
-    # pre-call
-    if debug_mode:
+    # pre-call log
+    if debug_mode and log:
         body_keys = list(body.keys()) if isinstance(body, dict) else None
         prop_cnt = len(body.get("object_properties", [])) if isinstance(body, dict) and "object_properties" in body else 0
-        boem_cnt = sum(len(q.get("items", [])) for q in body.get("boem", [])) if isinstance(body, dict) and "boem" in body else 0
-        _dbg(f">>> {method} {path} {params or ''}"
-             f"{(' body_keys=' + str(body_keys)) if body_keys else ''}"
-             f"{(' props=' + str(prop_cnt)) if prop_cnt else ''}"
-             f"{(' boem_items=' + str(boem_cnt)) if boem_cnt else ''}")
+        boem_cnt  = sum(len(q.get("items", [])) for q in body.get("boem", [])) if isinstance(body, dict) and "boem" in body else 0
+        _dbg(
+            f">>> {method} {path} {params or ''}"
+            f"{(' body_keys=' + str(body_keys)) if body_keys else ''}"
+            f"{(' props=' + str(prop_cnt)) if prop_cnt else ''}"
+            f"{(' boem_items=' + str(boem_cnt)) if boem_cnt else ''}"
+        )
 
-    r = requests.request(
-        method, url,
-        headers=hdr(),
-        params=params or {},
-        data=(json.dumps(body) if body is not None else None),
-        timeout=60
-    )
+    attempt = 0
+    wait_box = st.empty() if ui_feedback else None
 
-    status_line = f"[{r.status_code}] {method} {path}"
+    while True:
+        attempt += 1
+        r = requests.request(
+            method, url,
+            headers=hdr(),
+            params=params or {},
+            data=(json.dumps(body) if body is not None else None),
+            timeout=60
+        )
 
-    if r.status_code < 400:
-        # success (log even if empty 204)
-        if debug_mode:
-            if r.headers.get("Content-Type", "").startswith("application/json") and r.text:
-                try:
-                    payload = r.json()
-                    if isinstance(payload, dict) and "items" in payload and isinstance(payload["items"], list):
-                        _dbg(f"{status_line} items={len(payload['items'])}")
-                    elif isinstance(payload, dict) and "id" in payload:
-                        _dbg(f"{status_line} id={payload.get('id')}")
-                    else:
+        status_line = f"[{r.status_code}] {method} {path}"
+
+        # OK
+        if r.status_code < 400:
+            if debug_mode and log:
+                if r.headers.get("Content-Type", "").startswith("application/json") and r.text:
+                    try:
+                        payload = r.json()
+                        if isinstance(payload, dict) and "items" in payload and isinstance(payload["items"], list):
+                            _dbg(f"{status_line} items={len(payload['items'])}")
+                        elif isinstance(payload, dict) and "id" in payload:
+                            _dbg(f"{status_line} id={payload.get('id')}")
+                        else:
+                            _dbg(status_line)
+                    except Exception:
                         _dbg(status_line)
+                else:
+                    _dbg(status_line)  # e.g., 204
+            if wait_box:
+                wait_box.empty()
+            if expect_json and r.text:
+                try:
+                    return r.json()
                 except Exception:
-                    _dbg(status_line)
-            else:
-                _dbg(status_line)
-        if expect_json and r.text:
-            try:
-                return r.json()
-            except Exception:
-                return r.text
-        return r.text or ""
+                    return r.text
+            return r.text or ""
 
-    # errors
-    msg = (r.text or "").strip()
-    st.error(f"{status_line}: {msg[:800]}")
-    _dbg(f"{status_line} ERROR: {msg[:800]}")
-    r.raise_for_status()
+        # 429 handling
+        if r.status_code == 429 and retry_on_429:
+            if log and debug_mode:
+                _dbg(f"{status_line} RATE-LIMIT — waiting {wait_seconds}s (attempt {attempt})")
+            if ui_feedback:
+                # show countdown
+                for i in range(wait_seconds, 0, -1):
+                    wait_box.info(f"Rate limit hit (429). Waiting {i}s before retry (attempt {attempt})…")
+                    time.sleep(1)
+                wait_box.empty()
+            # then retry loop continues
+            continue
+
+        # Other errors
+        msg = (r.text or "").strip()
+        if ui_errors:
+            st.error(f"{status_line}: {msg[:800]}")
+        if log and debug_mode:
+            _dbg(f"{status_line} ERROR: {msg[:800]}")
+        r.raise_for_status()
 
 # Thin helpers
-def get_json(path: str, params: Dict=None):
-    return _request("GET", path, params=params, expect_json=True)
+def get_json(path: str, params: Dict=None, **kw):
+    return _request("GET", path, params=params, expect_json=True, **kw)
+def post_json(path: str, body: Dict, **kw):
+    return _request("POST", path, body=body, expect_json=True, **kw)
+def patch_json(path: str, body: Dict, **kw):
+    return _request("PATCH", path, body=body, expect_json=True, **kw)
 
-def post_json(path: str, body: Dict):
-    return _request("POST", path, body=body, expect_json=True)
-
-def patch_json(path: str, body: Dict):
-    return _request("PATCH", path, body=body, expect_json=True)
-
-# -------- cached fetchers keyed by connection --------
+# -------- cached fetchers keyed by connection (silent) --------
 @st.cache_data(show_spinner=False)
 def list_workspaces_cached(api_base: str, tenant_: str, api_key_: str):
-    return get_json("/workspaces")
+    return get_json("/workspaces", log=False, ui_errors=False, ui_feedback=False)
 
 @st.cache_data(show_spinner=False)
 def list_object_definitions_cached(api_base: str, tenant_: str, api_key_: str):
-    data = get_json("/object-definitions")
+    data = get_json("/object-definitions", log=False, ui_errors=False, ui_feedback=False)
     return data.get("items", data)
 
 # Uncached (fresh each preview/apply)
 def list_objects(workspace_id: str, object_def_id: str, take: int=2000):
     data = get_json("/objects", params={"workspace_id": workspace_id, "filter": object_def_id, "take": take})
     return data.get("items", data) or []
-
 def get_object(obj_id: str):
     return get_json(f"/objects/{obj_id}")
-
 def get_object_definition(def_id: str):
     return get_json(f"/object-definitions/{def_id}")
-
 def get_questionnaire(q_id: str):
     return get_json(f"/questionnaires/{q_id}")
-
 def create_object(title: str, object_def_id: str, workspace_id: str):
     body = {"object_title": title, "object_type_id": object_def_id, "workspace_id": workspace_id}
     return post_json("/objects", body)
-
 def patch_object(obj_id: str, body: Dict):
     return patch_json(f"/objects/{obj_id}", body)
 
@@ -183,17 +215,28 @@ if df.empty:
     st.error("The uploaded file is empty."); st.stop()
 df.columns = [str(c) for c in df.columns]
 
-# ---------------- Step 3: mapping (UX from v3.1) ----------------
+# ---------------- Step 3: mapping ----------------
 st.header("3) Mapping")
 with st.spinner("Loading definition & questionnaires…"):
     definition = get_object_definition(object_def_id)
-    bd_properties = [p["name"] for p in (definition.get("object_properties") or [])]
+    all_props = list(definition.get("object_properties") or [])
     related_boem = definition.get("related_boem") or []
     questionnaires = []
     for q in related_boem:
         try: questionnaires.append(get_questionnaire(q["id"]))
         except Exception: pass
 
+def _prop_is_linked_to_questionnaire(p: Dict) -> bool:
+    # Conservative heuristics: skip any property that mentions "boem" or "questionnaire"
+    s = json.dumps(p).lower()
+    return ("boem" in s) or ("questionnaire" in s)
+
+with st.expander("Property options", expanded=False):
+    hide_linked_props = st.checkbox("Hide properties that are linked to questionnaires", value=True)
+
+bd_properties = [p["name"] for p in all_props if not (hide_linked_props and _prop_is_linked_to_questionnaire(p))]
+
+# Build questionnaire field map: label -> (qid,fid,qname,fname)
 boem_field_options: Dict[str, Tuple[str, str, str, str]] = {}
 for q in questionnaires:
     qname = q.get("name", q.get("id"))
@@ -202,6 +245,7 @@ for q in questionnaires:
         label = f"{qname} – {fname}"
         boem_field_options[label] = (q["id"], f["id"], qname, fname)
 
+# Dynamic rows in session
 if "prop_rows" not in st.session_state: st.session_state.prop_rows = [{"bd":"(select)","csv":"(select)"}]
 if "boem_rows" not in st.session_state: st.session_state.boem_rows = [{"bd":"(select)","csv":"(select)"}]
 
@@ -245,8 +289,19 @@ for r in st.session_state.boem_rows:
     if r["bd"]!="(select)" and r["csv"]!="(select)":
         boem_map[boem_field_options[r["bd"]]] = r["csv"]
 
+# --- Title uniqueness check ---
 if not title_col:
-    st.error("Select a CSV column for **Object Title**."); st.stop()
+    st.error("Select a CSV column for **Object Title**.")
+    st.stop()
+titles_series = df[title_col].astype(str).str.strip()
+dupes = titles_series[titles_series.duplicated(keep=False) & titles_series.ne("")]
+if not dupes.empty:
+    sample = dupes.unique()[:10]
+    st.error(
+        "The selected **Object Title** column must be unique. "
+        f"Found {dupes.nunique()} duplicated titles. Examples: {', '.join(map(str, sample))}"
+    )
+    st.stop()
 
 # ---------------- Step 4: Preview (Generate) ----------------
 st.header("4) Preview")
@@ -264,9 +319,7 @@ if st.button("Generate preview"):
         try: return get_object(stub["id"])
         except Exception:
             return {"id": stub["id"], "object_title": stub.get("object_title") or stub.get("title") or "", "object_properties": [], "boem": []}
-
     def read_props(detail): return {p["name"]: str(p.get("value","")) for p in detail.get("object_properties", [])}
-
     def read_boem(detail):
         out={}
         for q in detail.get("boem", []):
@@ -317,8 +370,7 @@ if st.button("Generate preview"):
             for (qid,fid,qname,fname) in {(q,f,qn,fn) for (q,f,qn,fn) in boem_map.keys()}:
                 key = f"questionnaire({qname})_{fname}"
                 newv = target_boem.get(qid, {}).get(fid, "")
-                oldv = curr_boem.get(qid, {}).get(fid, ""
-                )
+                oldv = curr_boem.get(qid, {}).get(fid, "")
                 row[key] = newv
                 chg = (str(newv)!=str(oldv))
                 mask[key] = chg; any_change = any_change or chg
@@ -356,13 +408,19 @@ if st.button("Generate preview"):
             if k in mask_df.columns:
                 mask_df.loc[preview_df.index[i], k] = bool(v)
 
+    # Stronger colors for contrast
+    RED_BG = "#ffb3b3"   # stronger red
+    RED_FG = "#6b0000"
+    GREEN_BG = "#bff2bf" # stronger green
+    GREEN_FG = "#064b2d"
+
     def style_fn(val, col, idx):
         is_change = bool(mask_df.loc[idx, col]) if col in mask_df.columns else False
-        if col in ("Action","Id"):  # no coloring
+        if col in ("Action","Id"):
             return ""
-        bg = "#ffecec" if is_change else "#e9f9ee"
-        fg = "#7a0a0a" if is_change else "#0b5f2a"
-        return f"background-color: {bg}; color: {fg};"
+        bg = RED_BG if is_change else GREEN_BG
+        fg = RED_FG if is_change else GREEN_FG
+        return f"background-color: {bg}; color: {fg}; font-weight: 600;"
 
     styled = preview_df.style.apply(lambda s: [style_fn(v, s.name, s.index[i]) for i, v in enumerate(s)], axis=0)
     st.dataframe(styled, use_container_width=True)
@@ -421,4 +479,4 @@ if st.button("Apply now", disabled=("preview_df" not in st.session_state)):
     st.success(f"Done — Created: {created} • Updated: {updated} • Errors: {errors}")
     st.code("\n".join(logs), language="text")
 
-st.caption("Preview shows target values; green = unchanged, red = will change. Debug mode logs GET/POST/PATCH (incl. 204).")
+st.caption("Preview shows target values; green = unchanged, red = will change. 429s are auto-retried every 20s with a visible countdown.")
