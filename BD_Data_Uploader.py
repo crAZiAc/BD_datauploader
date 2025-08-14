@@ -1,47 +1,76 @@
-# bd_uploader_v43.py — Advanced logging UX + caption shows preview count
-import json, time, sys, subprocess, datetime
+# BD_Data_Uploader_v0_9.py
+# Streamlit app to upload/update BlueDolphin objects + create relationships
+# v0.9 = v56 Objects flow kept; Relationships from v59 (dedupe, label), plus:
+#   - POST /relations uses "label"
+#   - No API calls until tenant & x-api-key are provided
+#   - Logging panel (toggle successes), retry on 429 with countdown, CSV & multiselect separators,
+#     object property mapping by name, questionnaire validation, styled preview
+
+import json, time, sys, subprocess, datetime, re
 from email.utils import parsedate_to_datetime
-from typing import Dict, List, Tuple
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from typing import Dict, List, Tuple, Optional, Iterable
 
 import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="BlueDolphin Uploader v4.3", layout="wide")
+st.set_page_config(page_title="BlueDolphin Uploader v0.9", layout="wide")
 st.title("BlueDolphin CSV/Excel Uploader")
 
-# ---------------- Sidebar: connection ----------------
+# ---------------- Sidebar: connection + mode ----------------
 with st.sidebar:
     st.header("Connection")
     region = st.selectbox("Region", ["EU", "US"], index=0)
     API_BASE = "https://public-api.eu.bluedolphin.app/v1" if region == "EU" else "https://public-api.us.bluedolphin.app/v1"
-    tenant = st.text_input("Tenant", placeholder="yourtenant")
+    tenant = st.text_input("Tenant", placeholder="mytenant")
     api_key = st.text_input("x-api-key", type="password")
+
+    st.divider()
+    mode = st.radio("Mode", ["Objects", "Relationships"], index=0, horizontal=True)
+
+    st.divider()
+    if st.button("Reset configuration (keep tenant & key)"):
+        keep = {"debug_mode","log_show_ok"}
+        for k in list(st.session_state.keys()):
+            if k in keep:
+                continue
+            if re.match(r"^(prop_bd_|prop_csv_|boem_bd_|boem_csv_)", k):
+                st.session_state.pop(k, None)
+        for k in ("prop_row_count","boem_row_count","preview_df","preview_mask_change","preview_mask_invalid",
+                  "preview_meta","multi_value_sep","rel_prev","rel_ctx",
+                  "obj_csvsep_choice","obj_csvsep_custom","obj_vsep_choice","obj_vsep_custom",
+                  "map_title","map_id","confirm_apply_invalid"):
+            st.session_state.pop(k, None)
+        st.session_state["obj_upload_session"] = st.session_state.get("obj_upload_session", 0) + 1
+        st.session_state["rel_upload_session"] = st.session_state.get("rel_upload_session", 0) + 1
+        st.rerun()
 
 # --- state init ---
 for k, v in [
-    ("log_entries", []),              # list of dicts: {level: 'error'|'ok'|'info', text: str}
+    ("log_entries", []),
     ("log_placeholder", None),
     ("rate_box", None),
     ("debug_mode", False),
-    ("log_show_ok", False),          # include 2xx/success + pre-call
+    ("log_show_ok", False),
+    ("obj_upload_session", 0),
+    ("rel_upload_session", 0),
+    ("prop_row_count", 1),
+    ("boem_row_count", 1),
 ]:
-    if k not in st.session_state:
-        st.session_state[k] = v
+    if k not in st.session_state: st.session_state[k] = v
 
 # ---------------- Help (sidebar) ----------------
-with st.sidebar.expander("Help: API key & tenant", expanded=False):
+with st.sidebar.expander("Help: API key, tenant & rules", expanded=False):
     st.markdown(
         """
-**What key do I need?**
-- Use a **User API key**.
-- It inherits your own BlueDolphin permissions.
-- Treat it like a password.
+**What key do I need?**  
+Use a **User API key** (inherits your own permissions). Treat it like a password.
 
-**Where do I get it?**
-- See the **Quick Start Guide** (has steps to create a user API key).
-- **Tenant** = the part after `bluedolphin.app`
-  Example: `https://bluedolphin.app/mytenant → tenant = `mytenant`.
+**Where do I get it?**  
+See the **Quick Start Guide** (has steps to create a user API key).  
+**Tenant** = the part after `bluedolphin.app/`.  
+Example: `https://bluedolphin.app/mytenant` → tenant = `mytenant`.
 """
     )
     st.link_button(
@@ -49,66 +78,65 @@ with st.sidebar.expander("Help: API key & tenant", expanded=False):
         "https://support.valueblue.nl/hc/en-us/articles/13296899552668-Quick-Start-Guide"
     )
     st.divider()
-    if st.button("Test connection"):
-        try:
-            r = requests.get(f"{API_BASE}/workspaces", headers={"tenant": tenant or "", "x-api-key": api_key or ""}, timeout=30)
-            if r.status_code < 400:
-                st.success(f"OK — API key works for tenant '{tenant}' ({region}).")
-            else:
-                st.error(f"Failed: [{r.status_code}] {r.text[:300]}")
-        except Exception as e:
-            st.error(f"Connection failed: {e}")
+    st.markdown(
+        """
+### Business rules used by this app
+- **Title** must be unique per upload.
+- **Dropdown / Radio**: value must match one of the configured options.
+- **Multiselect**: if present, choose the file separator; comparison ignores order; payload uses `|`.
+- **Checkbox**: only `Yes` or `No` (case-sensitive).
+- **Number/Currency**:
+  - Up to **16 digits** total; thousands separators ok; decimal may be `.` or `,`.
+  - **Scientific notation** like `1.23E+26` is **not accepted** (flagged invalid).
+  - Preview equality ignores **trailing zeros** (e.g., `1.0` ≡ `1.000`).
+  - Values are sent with a `.` decimal separator and rounded to the field’s configured decimals when known.
+- **Object properties** are set by **name** (no validation metadata available).
+- **Preview colors**: green = unchanged, blue = valid change, red = invalid value.
+"""
+    )
 
 # ---------------- Advanced (sidebar): logging + cache ----------------
 with st.sidebar.expander("Advanced", expanded=False):
     st.session_state.debug_mode = st.checkbox("Enable logging", value=st.session_state.debug_mode)
     st.session_state.log_show_ok = st.checkbox("Include successes (2xx) & pre-calls", value=st.session_state.log_show_ok)
-    colsA = st.columns(2)
-    with colsA[0]:
+    cA, cB = st.columns(2)
+    with cA:
         if st.button("Clear log"):
             st.session_state.log_entries = []
-    with colsA[1]:
+    with cB:
         if st.button("Reload data (clear cache)"):
             st.cache_data.clear()
-            for k in ("preview_df", "preview_meta", "prop_rows", "boem_rows"):
+            for k in ("preview_df","preview_mask_change","preview_mask_invalid","preview_meta","rel_prev","rel_ctx","confirm_apply_invalid"):
                 st.session_state.pop(k, None)
 
-    # live log area (latest first, 20 lines tall, scrollable)
     if st.session_state["log_placeholder"] is None:
         st.session_state["log_placeholder"] = st.empty()
     def _render_log():
         show_ok = st.session_state.log_show_ok
-        # filter and reverse (latest first)
         filtered = []
         for entry in reversed(st.session_state.log_entries):
             if entry["level"] in ("ok", "info") and not show_ok:
                 continue
             filtered.append(entry)
-        # build html with colors, keep scrolling container ~20 lines
+        filtered = filtered[:20]  # latest first, show 20 lines
         html_lines = []
         for e in filtered:
             color = "#B00020" if e["level"] == "error" else ("#666" if e["level"] == "info" else "#1f4b2e")
-            html_lines.append(f'<div style="font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre;">'
-                              f'<span style="color:{color}">{e["text"]}</span></div>')
+            html_lines.append(
+                f'<div style="font-family: ui-monospace, Menlo, Consolas, monospace; white-space: pre;"><span style="color:{color}">{e["text"]}</span></div>'
+            )
         html = (
             '<div style="border:1px solid #ddd; border-radius:6px; padding:8px; height:22em; overflow:auto; background:#fafafa;">'
-            + "".join(html_lines) +
-            '</div>'
+            + "".join(html_lines) + '</div>'
         )
         st.session_state["log_placeholder"].markdown(html, unsafe_allow_html=True)
     _render_log()
 
 def _log(level: str, text: str):
-    # append & re-render (visible area fixed height; latest shown first)
     st.session_state.log_entries.append({"level": level, "text": text})
-    # only repaint if advanced section rendered this run
-    if st.session_state.get("log_placeholder"):
-        # repaint with current filters
-        with st.sidebar:
-            with st.sidebar.expander("Advanced", expanded=False):
-                pass  # placeholder exists; _render ran already in this cycle
 
-def _is_logging(): return bool(st.session_state.debug_mode)
+def _is_logging() -> bool:
+    return bool(st.session_state.debug_mode)
 
 # ---------------- Connection cache scoping ----------------
 def hdr() -> Dict[str, str]:
@@ -118,25 +146,22 @@ conn_key = f"{region}|{tenant}|{(api_key or '')[:8]}"
 if st.session_state.get("conn_key") != conn_key:
     st.cache_data.clear()
     st.session_state.conn_key = conn_key
-    for k in ("preview_df", "preview_meta", "prop_rows", "boem_rows"):
+    for k in ("preview_df","preview_mask_change","preview_mask_invalid","preview_meta","rel_prev","rel_ctx","confirm_apply_invalid"):
         st.session_state.pop(k, None)
 
-# for visible 429 waits (shared)
 if st.session_state.rate_box is None:
     st.session_state.rate_box = st.empty()
 
-# ---------------- Request helper with per-call retry + countdown ----------------
+# ---------------- Request helper with retry + countdown ----------------
 def _retry_after_seconds(resp, fallback: int) -> int:
     h = resp.headers.get("Retry-After")
-    if not h:
-        return fallback
+    if not h: return fallback
     try:
         return max(1, int(h))
     except Exception:
         try:
             dt = parsedate_to_datetime(h)
-            if not dt.tzinfo:
-                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            if not dt.tzinfo: dt = dt.replace(tzinfo=datetime.timezone.utc)
             wait = int((dt - datetime.datetime.now(datetime.timezone.utc)).total_seconds())
             return max(1, wait)
         except Exception:
@@ -148,7 +173,6 @@ def _request(method: str, path: str, *, params: Dict=None, body: Dict=None,
              wait_seconds: int=20, max_retries: int=4, respect_retry_after: bool=True):
     url = f"{API_BASE}{path}"
 
-    # pre-call
     if _is_logging() and log and st.session_state.log_show_ok:
         body_keys = list(body.keys()) if isinstance(body, dict) else None
         prop_cnt = len(body.get("object_properties", [])) if isinstance(body, dict) and "object_properties" in body else 0
@@ -174,20 +198,7 @@ def _request(method: str, path: str, *, params: Dict=None, body: Dict=None,
         status_line = f"[{r.status_code}] {method} {path}"
 
         if r.status_code < 400:
-            if _is_logging() and log:
-                if r.headers.get("Content-Type", "").startswith("application/json") and r.text:
-                    try:
-                        payload = r.json()
-                        if isinstance(payload, dict) and "items" in payload and isinstance(payload["items"], list):
-                            _log("ok", f"{status_line} items={len(payload['items'])}")
-                        elif isinstance(payload, dict) and "id" in payload:
-                            _log("ok", f"{status_line} id={payload.get('id')}")
-                        else:
-                            _log("ok", status_line)
-                    except Exception:
-                        _log("ok", status_line)
-                else:
-                    _log("ok", status_line)
+            if _is_logging() and log: _log("ok", status_line)
             if wait_box_side: wait_box_side.empty()
             if wait_box_main: wait_box_main.empty()
             if expect_json and r.text:
@@ -198,7 +209,7 @@ def _request(method: str, path: str, *, params: Dict=None, body: Dict=None,
         if r.status_code == 429 and retry_on_429 and attempt <= max_retries:
             wait_for = _retry_after_seconds(r, wait_seconds) if respect_retry_after else wait_seconds
             if _is_logging() and log:
-                _log("info", f"{status_line} RATE-LIMIT — waiting {wait_for}s (attempt {attempt}/{max_retries})")
+                _log("info", f"{status_line} waiting {wait_for}s (attempt {attempt}/{max_retries})")
             if ui_feedback:
                 for i in range(wait_for, 0, -1):
                     msg = f"Working… waiting {i}s before retry (attempt {attempt}/{max_retries})"
@@ -208,7 +219,6 @@ def _request(method: str, path: str, *, params: Dict=None, body: Dict=None,
                 if wait_box_main: wait_box_main.empty()
             continue
 
-        # error
         msg = (r.text or "").strip()
         if r.status_code == 429 and retry_on_429 and attempt > max_retries:
             msg = f"Gave up after {max_retries} retries. {msg}"
@@ -222,7 +232,7 @@ def get_json(path: str, params: Dict=None, **kw):  return _request("GET", path, 
 def post_json(path: str, body: Dict, **kw):        return _request("POST", path, body=body, expect_json=True, **kw)
 def patch_json(path: str, body: Dict, **kw):       return _request("PATCH", path, body=body, expect_json=True, **kw)
 
-# ---------------- Cached fetchers (silent) ----------------
+# ---------------- Cached fetchers ----------------
 @st.cache_data(show_spinner=False)
 def list_workspaces_cached(api_base: str, tenant_: str, api_key_: str):
     return get_json("/workspaces", log=False, ui_errors=False, ui_feedback=False)
@@ -243,276 +253,939 @@ def create_object(title: str, object_def_id: str, workspace_id: str):
     return post_json("/objects", {"object_title": title, "object_type_id": object_def_id, "workspace_id": workspace_id})
 def patch_object(obj_id: str, body: Dict): return patch_json(f"/objects/{obj_id}", body)
 
-# ---------------- Step 1 ----------------
-st.header("1) Pick workspace & object definition")
-if not (tenant and api_key):
-    st.info("Enter **tenant** and **x-api-key** in the sidebar.")
-    st.stop()
+# -------- Relationships API --------
+def get_relation(rel_id: str) -> dict:
+    return get_json(f"/relations/{rel_id}")
 
-try:
-    ws = list_workspaces_cached(API_BASE, tenant, api_key); ws_map = {w["name"]: w["id"] for w in ws}
-except Exception as e:
-    st.error(e); st.stop()
-workspace = st.selectbox("Workspace", sorted(ws_map.keys())); workspace_id = ws_map[workspace]
+def post_relationship(template_id: str, from_id: str, to_id: str, label: Optional[str], lifecycle: Optional[str]):
+    body = {
+        "template_id": template_id,
+        "from_object_id": from_id,
+        "to_object_id": to_id,
+    }
+    if label:
+        body["label"] = str(label)  # <-- use 'label' on POST
+    if lifecycle in {"Current", "Future"}:
+        body["relationship_lifecycle_state"] = lifecycle
+    return post_json("/relations", body)
 
-try:
-    obj_defs = list_object_definitions_cached(API_BASE, tenant, api_key); od_map = {od.get("name", od.get("id")): od["id"] for od in obj_defs}
-except Exception as e:
-    st.error(e); st.stop()
-objdef_label = st.selectbox("Object definition", sorted(od_map.keys())); object_def_id = od_map[objdef_label]
+# ===== Utilities for object properties by NAME =====
+def _iter_dict_lists(d: Dict) -> Iterable[List[Dict]]:
+    for k, v in (d or {}).items():
+        if isinstance(v, list) and v and isinstance(v[0], dict):
+            yield v
 
-# ---------------- Step 2 ----------------
-def ensure_pkg(pkg: str) -> bool:
+def _extract_property_names_from_definition(defn: Dict) -> List[str]:
+    names: List[str] = []
+    if isinstance(defn.get("object_properties"), list):
+        for p in defn["object_properties"]:
+            name = p.get("name")
+            if name: names.append(str(name))
+    if names: return sorted(dict.fromkeys(names))
+    seen = []
+    for lst in _iter_dict_lists(defn):
+        for p in lst:
+            nm = p.get("name")
+            if nm: seen.append(str(nm))
+    return sorted(dict.fromkeys(seen))
+
+def _discover_property_names_from_objects(workspace_id: str, object_def_id: str, sample: int = 10) -> List[str]:
+    names: List[str] = []
     try:
-        __import__(pkg); return True
-    except ImportError:
-        try:
-            with st.spinner(f"Installing {pkg}…"):
-                subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
-            __import__(pkg); return True
-        except Exception as e:
-            st.error(f"Failed to install {pkg}: {e}"); return False
+        objs = list_objects(workspace_id, object_def_id, take=max(50, sample))
+        for o in objs[:sample]:
+            try:
+                full = get_object(o["id"])
+                for it in full.get("object_properties", []):
+                    nm = it.get("name")
+                    if nm: names.append(str(nm))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return sorted(dict.fromkeys(names))
 
-st.header("2) Upload CSV / Excel")
-up = st.file_uploader("Choose file", type=["csv", "xlsx", "xls", "xlsm"])
-if not up: st.stop()
-try:
-    n = up.name.lower()
-    if n.endswith(".csv"):
-        df = pd.read_csv(up)
-    elif n.endswith((".xlsx", ".xlsm")):
-        if not ensure_pkg("openpyxl"): st.stop()
-        df = pd.read_excel(up, engine="openpyxl")
+# ====== Mapping-row auto-add callbacks (Objects) ======
+def _maybe_add_prop_row(last_idx: int):
+    bd = st.session_state.get(f"prop_bd_{last_idx}", "(select)")
+    csvv = st.session_state.get(f"prop_csv_{last_idx}", "(select)")
+    if last_idx == st.session_state.get("prop_row_count", 1) - 1:
+        if bd and bd != "(select)" and csvv and csvv != "(select)":
+            st.session_state["prop_row_count"] = st.session_state.get("prop_row_count", 1) + 1
+
+def _maybe_add_boem_row(last_idx: int):
+    bd = st.session_state.get(f"boem_bd_{last_idx}", "(select)")
+    csvv = st.session_state.get(f"boem_csv_{last_idx}", "(select)")
+    if last_idx == st.session_state.get("boem_row_count", 1) - 1:
+        if bd and bd != "(select)" and csvv and csvv != "(select)":
+            st.session_state["boem_row_count"] = st.session_state.get("boem_row_count", 1) + 1
+
+# ====== Value normalization & comparison (Objects) ======
+def _classify_type(ft: str) -> str:
+    ft = (ft or "").lower()
+    if ft == "checkbox": return "checkbox"
+    if ft in {"multiselect"} or "multi" in ft: return "dropdown_multi"
+    if ft in {"dropdown", "radio", "select", "combobox"}: return "dropdown_single"
+    if ft in {"currency"}: return "currency"
+    if ft in {"number", "numeric", "decimal", "float", "integer"}: return "number"
+    if ft in {"date", "datetime"}: return "date"
+    return "text"
+
+def _parse_decimal_like(s: str) -> Optional[Decimal]:
+    """Parse numbers but reject scientific notation as invalid for BD rules."""
+    if s is None: return None
+    v = str(s).strip()
+    if v == "": return None
+    if "e" in v.lower(): return None  # explicitly reject sci-notation
+    v = v.replace(" ", "")
+    dot = v.rfind("."); com = v.rfind(",")
+    if dot != -1 and com != -1:
+        if dot > com:  # '.' is decimal
+            v = v.replace(",", "")
+        else:          # ',' is decimal
+            v = v.replace(".", "")
+            v = v.replace(",", ".")
     else:
-        if not ensure_pkg("xlrd"): st.stop()
-        df = pd.read_excel(up, engine="xlrd")
-except Exception as e:
-    st.error(f"Could not read file: {e}"); st.stop()
-if df.empty:
-    st.error("The uploaded file is empty."); st.stop()
-df.columns = [str(c) for c in df.columns]
+        if "," in v and "." not in v:
+            v = v.replace(",", ".")
+    try:
+        return Decimal(v)
+    except InvalidOperation:
+        return None
 
-# ---------------- Step 3 ----------------
-st.header("3) Mapping")
-with st.spinner("Loading definition & questionnaires…"):
-    definition = get_object_definition(object_def_id)
-    all_props = list(definition.get("object_properties") or [])
-    related_boem = definition.get("related_boem") or []
-    questionnaires = []
-    for q in related_boem:
-        try: questionnaires.append(get_questionnaire(q["id"]))
-        except Exception: pass
+def _quantize(d: Decimal, decimals: Optional[int]) -> Decimal:
+    if decimals is None: return d
+    q = Decimal(10) ** -decimals
+    return d.quantize(q, rounding=ROUND_HALF_UP)
 
-def _prop_is_linked_to_questionnaire(p: Dict) -> bool:
-    s = json.dumps(p).lower()
-    return ("boem" in s) or ("questionnaire" in s) or ("question" in s)
+def _canon_for_compare(cfg: Dict, raw_val: str, multi_sep: str) -> str:
+    typ = cfg.get("type","text")
+    if typ == "dropdown_multi":
+        if raw_val is None: return ""
+        parts = [p.strip() for p in str(raw_val).split(multi_sep) if str(p).strip()!=""]
+        return "|".join(sorted(parts))
+    if typ in {"number","currency"}:
+        d = _parse_decimal_like(raw_val)
+        if d is None: return ""
+        d = _quantize(d, cfg.get("decimals"))
+        return f"{d:f}"
+    return "" if raw_val is None else str(raw_val).strip()
 
-with st.expander("Property options", expanded=False):
-    hide_linked_props = st.checkbox("Hide properties that are linked to questionnaires", value=True)
-bd_properties = [p["name"] for p in all_props if not (hide_linked_props and _prop_is_linked_to_questionnaire(p))]
+def _canon_for_payload(cfg: Dict, raw_val: str, multi_sep: str) -> str:
+    typ = cfg.get("type","text")
+    if raw_val is None: return ""
+    if typ == "dropdown_multi":
+        parts = [p.strip() for p in str(raw_val).split(multi_sep) if str(p).strip()!=""]
+        return "|".join(parts)
+    if typ in {"number","currency"}:
+        d = _parse_decimal_like(raw_val)
+        if d is None: return ""
+        d = _quantize(d, cfg.get("decimals"))
+        decs = cfg.get("decimals")
+        if decs is not None:
+            fmt = f"{{0:.{decs}f}}"
+            return fmt.format(d).replace(",", ".")
+        return f"{d:f}"
+    return str(raw_val).strip()
 
-boem_field_options: Dict[str, Tuple[str, str, str, str]] = {}
-for q in questionnaires:
-    qname = q.get("name", q.get("id"))
-    for f in q.get("fields", []):
-        fname = f.get("name"); label = f"{qname} – {fname}"
-        boem_field_options[label] = (q["id"], f["id"], qname, fname)
+# ========= OBJECTS FLOW (kept as v56) =========
+def objects_flow():
+    # Block API calls until we have both tenant & key
+    if not tenant or not api_key:
+        st.info("Enter **Tenant** and **API key** in the sidebar to start.")
+        return
 
-if "prop_rows" not in st.session_state: st.session_state.prop_rows = [{"bd":"(select)","csv":"(select)"}]
-if "boem_rows" not in st.session_state: st.session_state.boem_rows = [{"bd":"(select)","csv":"(select)"}]
+    # ---------------- Step 1 ----------------
+    st.header("1) Pick workspace & object definition")
+    try:
+        ws = list_workspaces_cached(API_BASE, tenant, api_key); ws_map = {w["name"]: w["id"] for w in ws}
+    except Exception as e:
+        st.error(e); st.stop()
+    workspace = st.selectbox("Workspace", sorted(ws_map.keys()), key="obj_ws"); workspace_id = ws_map[workspace]
 
-c1, c2 = st.columns([1, 1])
-with c1: st.markdown("**Object Title (required)**")
-with c2: title_col = st.selectbox("CSV column for title", list(df.columns), key="map_title", label_visibility="collapsed")
+    try:
+        obj_defs = list_object_definitions_cached(API_BASE, tenant, api_key); od_map = {od.get("name", od.get("id")): od["id"] for od in obj_defs}
+    except Exception as e:
+        st.error(e); st.stop()
+    objdef_label = st.selectbox("Object definition", sorted(od_map.keys()), key="obj_def"); object_def_id = od_map[objdef_label]
 
-c3, c4 = st.columns([1, 1])
-with c3: st.markdown("Object ID (optional)")
-with c4: object_id_col = st.selectbox("CSV column for object_id", ["(none)"] + list(df.columns), key="map_id", label_visibility="collapsed")
-
-st.divider()
-st.subheader("Object properties (optional)")
-for i in range(len(st.session_state.prop_rows)):
-    cA, cB = st.columns([1, 1])
-    with cA: st.session_state.prop_rows[i]["bd"] = st.selectbox("Property", ["(select)"] + bd_properties, key=f"prop_bd_{i}")
-    with cB: st.session_state.prop_rows[i]["csv"] = st.selectbox("CSV column", ["(select)"] + list(df.columns), key=f"prop_csv_{i}")
-if st.session_state.prop_rows[-1]["bd"]!="(select)" and st.session_state.prop_rows[-1]["csv"]!="(select)":
-    st.session_state.prop_rows.append({"bd":"(select)","csv":"(select)"})
-
-st.divider()
-st.subheader("Questionnaires (optional)")
-boem_labels = ["(select)"] + list(boem_field_options.keys())
-for i in range(len(st.session_state.boem_rows)):
-    cA, cB = st.columns([1, 1])
-    with cA: st.session_state.boem_rows[i]["bd"] = st.selectbox("Questionnaire – Field", boem_labels, key=f"boem_bd_{i}")
-    with cB: st.session_state.boem_rows[i]["csv"] = st.selectbox("CSV column", ["(select)"] + list(df.columns), key=f"boem_csv_{i}")
-if st.session_state.boem_rows[-1]["bd"]!="(select)" and st.session_state.boem_rows[-1]["csv"]!="(select)":
-    st.session_state.boem_rows.append({"bd":"(select)","csv":"(select)"})
-
-prop_map = {r["bd"]: r["csv"] for r in st.session_state.prop_rows if r["bd"]!="(select)" and r["csv"]!="(select)"}
-boem_map: Dict[Tuple[str,str,str,str], str] = {}
-for r in st.session_state.boem_rows:
-    if r["bd"]!="(select)" and r["csv"]!="(select)":
-        boem_map[boem_field_options[r["bd"]]] = r["csv"]
-
-if not title_col:
-    st.error("Select a CSV column for **Object Title**."); st.stop()
-titles_series = df[title_col].astype(str).str.strip()
-dupes = titles_series[titles_series.duplicated(keep=False) & titles_series.ne("")]
-if not dupes.empty:
-    sample = dupes.unique()[:10]
-    st.error(f"**Object Title** must be unique. Found {dupes.nunique()} duplicates. Examples: {', '.join(map(str, sample))}")
-    st.stop()
-
-# ---------------- Step 4 ----------------
-st.header("4) Preview")
-if st.button("Generate preview"):
-    with st.spinner("Retrieving existing objects…"):
-        existing = list_objects(workspace_id, object_def_id)
-
-    by_id = {o["id"]: o for o in existing if "id" in o}
-    by_title = {str((o.get("object_title") or o.get("title"))): o for o in existing if (o.get("object_title") or o.get("title"))}
-
-    def get_detail(stub):
-        try: return get_object(stub["id"])
-        except Exception: return {"id": stub["id"], "object_title": stub.get("object_title") or stub.get("title") or "", "object_properties": [], "boem": []}
-    def read_props(detail): return {p["name"]: str(p.get("value","")) for p in detail.get("object_properties", [])}
-    def read_boem(detail):
-        out={}; 
-        for q in detail.get("boem", []):
-            qid=q.get("id"); 
-            if not qid: continue
-            out[qid]={it["id"]:str(it.get("value","")) for it in q.get("items", [])}
-        return out
-
-    preview_cols = ["Action","Object_Title","Id"]
-    prop_cols = [f"objectproperty_{p}" for p in prop_map.keys()]
-    boem_cols = [f"questionnaire({qname})_{fname}" for (_,_,qname,fname) in boem_map.keys()]
-    preview_cols += prop_cols + boem_cols
-
-    rows, mask_rows, meta = [], [], []
-    for _, r in df.iterrows():
-        title_target = str(r.get(title_col, "")).strip()
-        if not title_target: continue
-        obj_id_val = "" if object_id_col=="(none)" else str(r.get(object_id_col, "")).strip()
-        target_props = {p: ("" if pd.isna(r.get(csv,"")) else str(r.get(csv,""))) for p, csv in prop_map.items()}
-        target_boem = {}
-        for (qid,fid,qname,fname), csv in boem_map.items():
-            val = "" if pd.isna(r.get(csv,"")) else str(r.get(csv,""))
-            target_boem.setdefault(qid, {})[fid] = val
-
-        stub = by_id.get(obj_id_val) if obj_id_val else by_title.get(title_target)
-        if stub:
-            detail = get_detail(stub)
-            curr_title = str(detail.get("object_title",""))
-            curr_props = read_props(detail); curr_boem = read_boem(detail)
-            row = {"Action":"Update","Object_Title":title_target,"Id":detail["id"]}
-            mask = {"Action":False,"Object_Title":(title_target!=curr_title),"Id":False}
-            any_change = (title_target!=curr_title)
-            for p in prop_map.keys():
-                newv = target_props.get(p,""); oldv = curr_props.get(p,"")
-                row[f"objectproperty_{p}"] = newv
-                chg = (str(newv)!=str(oldv)); mask[f"objectproperty_{p}"]=chg; any_change |= chg
-            for (qid,fid,qname,fname) in {(q,f,qn,fn) for (q,f,qn,fn) in boem_map.keys()}:
-                key=f"questionnaire({qname})_{fname}"
-                newv = target_boem.get(qid, {}).get(fid, ""); oldv = curr_boem.get(qid, {}).get(fid, "")
-                row[key]=newv; chg=(str(newv)!=str(oldv)); mask[key]=chg; any_change |= chg
-            if any_change:
-                rows.append(row); mask_rows.append(mask)
-                meta.append({
-                    "new": False, "id": detail["id"],
-                    "title_update": title_target if (title_target!=curr_title) else None,
-                    "prop_updates": {p: target_props[p] for p in prop_map.keys() if mask.get(f"objectproperty_{p}", False)},
-                    "boem_updates": {qid: {fid: target_boem[qid][fid]
-                                           for fid in target_boem.get(qid, {})
-                                           if mask.get(f"questionnaire({[v[2] for v in boem_map.keys() if v[0]==qid and v[1]==fid][0]})_{[v[3] for v in boem_map.keys() if v[0]==qid and v[1]==fid][0]}", False)}
-                                     for qid in target_boem.keys()}
-                })
-        else:
-            row={"Action":"Create","Object_Title":title_target,"Id":""}
-            mask={"Action":False,"Object_Title":True,"Id":False}
-            for p in prop_map.keys():
-                row[f"objectproperty_{p}"]=target_props.get(p,""); mask[f"objectproperty_{p}"]=True
-            for (qid,fid,qname,fname) in boem_map.keys():
-                key=f"questionnaire({qname})_{fname}"
-                row[key]=target_boem.get(qid, {}).get(fid, ""); mask[key]=True
-            rows.append(row); mask_rows.append(mask)
-            meta.append({"new": True,"id":"","title":title_target,"props":target_props,"boem":target_boem})
-
-    if not rows:
-        st.info("Nothing to create or update based on current mapping."); st.stop()
-
-    preview_df = pd.DataFrame(rows, columns=preview_cols)
-    mask_df = pd.DataFrame(False, index=preview_df.index, columns=preview_df.columns)
-    for i, m in enumerate(mask_rows):
-        for k, v in m.items():
-            if k in mask_df.columns:
-                mask_df.loc[preview_df.index[i], k] = bool(v)
-
-    RED_BG, RED_FG = "#ff9a9a", "#6b0000"
-    GREEN_BG, GREEN_FG = "#a9f0a9", "#064b2d"
-    def style_fn(val, col, idx):
-        is_change = bool(mask_df.loc[idx, col]) if col in mask_df.columns else False
-        if col in ("Action","Id"): return ""
-        bg = RED_BG if is_change else GREEN_BG
-        fg = RED_FG if is_change else GREEN_FG
-        return f"background-color:{bg}; color:{fg}; font-weight:600;"
-    styled = preview_df.style.apply(lambda s: [style_fn(v, s.name, s.index[i]) for i, v in enumerate(s)], axis=0)
-    st.dataframe(styled, use_container_width=True)
-
-    st.session_state.preview_df = preview_df
-    st.session_state.preview_mask = mask_df
-    st.session_state.preview_meta = meta
-    st.success(f"Preview ready: {len(preview_df)} rows")
-
-# ---------------- Step 5 ----------------
-st.header("5) Apply changes")
-if st.button("Apply now", disabled=("preview_df" not in st.session_state)):
-    if "preview_df" not in st.session_state:
-        st.warning("Click **Generate preview** first."); st.stop()
-
-    meta = st.session_state.preview_meta
-    created = updated = errors = 0
-    logs = []
-    prog = st.progress(0.0, text="Working…")
-
-    def boem_payload_from_dict(d: Dict[str, Dict[str,str]]):
-        return [{"id": qid, "items": [{"id": fid, "value": val} for fid, val in fields.items()]} for qid, fields in d.items() if fields]
-
-    for i, item in enumerate(meta):
+    # ---------------- Step 2 ----------------
+    def ensure_pkg(pkg: str) -> bool:
         try:
-            if item["new"]:
-                res = create_object(item["title"], object_def_id, workspace_id)
-                new_id = res.get("id")
-                patch_body = {}
-                if item["props"]:
-                    patch_body["object_properties"] = [{"name": k, "value": v} for k, v in item["props"].items()]
-                if item["boem"]:
-                    patch_body["boem"] = boem_payload_from_dict(item["boem"])
-                if patch_body:
-                    patch_object(new_id, patch_body)
-                created += 1; logs.append(f"Create → id={new_id}")
+            __import__(pkg); return True
+        except ImportError:
+            try:
+                with st.spinner(f"Installing {pkg}…"):
+                    subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+                __import__(pkg); return True
+            except Exception as e:
+                st.error(f"Failed to install {pkg}: {e}"); return False
+
+    st.header("2) Upload CSV / Excel")
+    up = st.file_uploader("Choose file", type=["csv", "xlsx", "xls", "xlsm"], key=f"obj_uploader_{st.session_state.obj_upload_session}")
+    if not up: st.stop()
+
+    # ----- CSV/Excel reading + CSV options -----
+    is_csv = up.name.lower().endswith(".csv")
+    csv_col_sep = None
+
+    if is_csv:
+        with st.expander("CSV options", expanded=False):
+            sep_choice = st.selectbox(
+                "CSV column separator",
+                ["Auto-detect", "Comma (,)", "Semicolon (;)", "Pipe (|)", "Tab (\\t)", "Custom…"],
+                index=0, key="obj_csvsep_choice"
+            )
+            if sep_choice == "Auto-detect": csv_col_sep = None
+            elif sep_choice == "Comma (,)": csv_col_sep = ","
+            elif sep_choice == "Semicolon (;)": csv_col_sep = ";"
+            elif sep_choice == "Pipe (|)": csv_col_sep = "|"
+            elif sep_choice == "Tab (\\t)": csv_col_sep = "\t"
             else:
-                patch_body = {}
-                if item["title_update"]:
-                    patch_body["object_title"] = item["title_update"]
-                if item["prop_updates"]:
-                    patch_body["object_properties"] = [{"name": k, "value": v} for k, v in item["prop_updates"].items()]
-                boem_clean = {qid: fields for qid, fields in (item.get("boem_updates") or {}).items() if fields}
-                if boem_clean:
-                    patch_body["boem"] = boem_payload_from_dict(boem_clean)
-                if patch_body:
-                    patch_object(item["id"], patch_body)
-                    updated += 1; logs.append(f"Update → id={item['id']}")
-        except Exception as e:
-            errors += 1; logs.append(f"ERROR: {e}")
-        prog.progress((i+1)/max(1,len(meta)))
+                csv_col_sep = st.text_input("Custom separator (1–3 chars)", value=";", max_chars=3, key="obj_csvsep_custom") or ";"
 
-    st.success(f"Done — Created: {created} • Updated: {updated} • Errors: {errors}")
-    st.code("\n".join(logs), language="text")
+    try:
+        n = up.name.lower()
+        if n.endswith(".csv"):
+            if csv_col_sep is None: df = pd.read_csv(up)
+            else: df = pd.read_csv(up, sep=csv_col_sep, engine="python")
+        elif n.endswith((".xlsx", ".xlsm")):
+            if not ensure_pkg("openpyxl"): st.stop()
+            df = pd.read_excel(up, engine="openpyxl")
+        else:
+            if not ensure_pkg("xlrd"): st.stop()
+            df = pd.read_excel(up, engine="xlrd")
+    except Exception as e:
+        st.error(f"Could not read file: {e}"); st.stop()
+    if df.empty:
+        st.error("The uploaded file is empty."); st.stop()
+    df.columns = [str(c) for c in df.columns]
 
-# ---------------- Bottom caption (no technical jargon) ----------------
-count = st.session_state.get("preview_df").shape[0] if "preview_df" in st.session_state else 0
-msg = f"Preview shows target values; green = unchanged, red = will change. Objects in preview: {count}."
-if count > 100:
-    msg += " This may take a little while to complete."
-st.caption(msg)
+    # ---------------- Step 3 (mapping) ----------------
+    st.header("3) Mapping")
+    with st.spinner("Loading questionnaires & properties…"):
+        definition = get_object_definition(object_def_id)
+
+        # Questionnaires
+        related_boem = definition.get("related_boem") or []
+        questionnaires = []
+        for q in related_boem:
+            try:
+                questionnaires.append(get_questionnaire(q["id"]))
+            except Exception:
+                pass
+
+        # Object properties by NAME
+        prop_names = _extract_property_names_from_definition(definition)
+        if not prop_names:
+            prop_names = _discover_property_names_from_objects(workspace_id, object_def_id, sample=10)
+        if _is_logging():
+            _log("info", f"object_properties discovered (by name): {len(prop_names)}")
+
+    # Build selectable questionnaire fields + configs
+    boem_field_options: Dict[str, Tuple[str, str, str, str]] = {}
+    field_config: Dict[Tuple[str, str], Dict] = {}
+    has_multi = False
+
+    for q in questionnaires:
+        qname = q.get("name", q.get("id"))
+        for f in q.get("fields", []):
+            ftype_raw = f.get("field_type") or f.get("type") or ""
+            ftype = _classify_type(ftype_raw)
+            if (ftype_raw or "").lower() == "relation":  # ignore relation fields
+                continue
+            fid = f.get("id"); fname = f.get("name"); qid = q.get("id")
+            label = f"{qname} – {fname}"
+            boem_field_options[label] = (qid, fid, qname, fname)
+
+            allowed = set()
+            if ftype in {"dropdown_single", "dropdown_multi"}:
+                for opt in f.get("specified_values", []) or []:
+                    if isinstance(opt, dict):
+                        val = opt.get("Value") or opt.get("value") or opt.get("name") or opt.get("label")
+                    else:
+                        val = str(opt)
+                    if val is not None: allowed.add(str(val))
+
+            if ftype == "dropdown_multi": has_multi = True
+
+            field_config[(qid, fid)] = {
+                "type": ftype,
+                "allowed": allowed,
+                "decimals": f.get("number_of_decimals", None) if ftype in {"number","currency"} else None
+            }
+
+    # Multi-select value separator — only if there *are* multi-select fields
+    if has_multi:
+        with st.expander("Multi-select value separator", expanded=True):
+            vsep_choice = st.selectbox(
+                "Separator used in your file for multi-select questionnaire values",
+                ["|", ";", ",", "/", "Custom…"],
+                index=0, key="obj_vsep_choice"
+            )
+            if vsep_choice == "Custom…":
+                multi_value_sep = st.text_input("Custom multi-select separator (1–3 chars)", value="|", max_chars=3, key="obj_vsep_custom") or "|"
+            else:
+                multi_value_sep = vsep_choice
+        st.caption("We validate with this separator and **normalize to `|`** in the API payload.")
+    else:
+        multi_value_sep = "|"
+
+    # Title + ID mapping
+    c1, c2 = st.columns([1, 1])
+    with c1: st.markdown("**Object Title (required)**")
+    with c2: title_col = st.selectbox("CSV column for title", list(df.columns), key="map_title", label_visibility="collapsed")
+
+    c3, c4 = st.columns([1, 1])
+    with c3: st.markdown("Object ID (optional)")
+    with c4: object_id_col = st.selectbox("CSV column for object_id", ["(none)"] + list(df.columns), key="map_id", label_visibility="collapsed")
+
+    # Object properties (by NAME) — prevent duplicates across rows (hide picks from earlier rows only)
+    st.divider(); st.subheader("Object properties (optional)")
+    for i in range(st.session_state.prop_row_count):
+        current = st.session_state.get(f"prop_bd_{i}", "(select)")
+        picked = set()
+        for j in range(st.session_state.prop_row_count):
+            if j >= i:  # only earlier rows
+                continue
+            v = st.session_state.get(f"prop_bd_{j}", "(select)")
+            if v and v != "(select)":
+                picked.add(v)
+        prop_opts = ["(select)"] + [p for p in prop_names if (p not in picked) or (p == current)]
+        cA, cB = st.columns([1, 1])
+        with cA:
+            st.selectbox("Property (name)", prop_opts, key=f"prop_bd_{i}",
+                         on_change=_maybe_add_prop_row, args=(i,))
+        with cB:
+            st.selectbox("CSV column", ["(select)"] + list(df.columns), key=f"prop_csv_{i}",
+                         on_change=_maybe_add_prop_row, args=(i,))
+    prop_map: Dict[str, str] = {}
+    for i in range(st.session_state.prop_row_count):
+        bd = st.session_state.get(f"prop_bd_{i}", "(select)")
+        csvc = st.session_state.get(f"prop_csv_{i}", "(select)")
+        if bd != "(select)" and csvc != "(select)": prop_map[bd] = csvc
+
+    # Questionnaires — prevent duplicates across rows (hide picks from earlier rows only)
+    st.divider(); st.subheader("Questionnaires (optional)")
+    boem_labels_all = list(boem_field_options.keys())
+    for i in range(st.session_state.boem_row_count):
+        current = st.session_state.get(f"boem_bd_{i}", "(select)")
+        picked = set()
+        for j in range(st.session_state.boem_row_count):
+            if j >= i:  # only earlier rows
+                continue
+            v = st.session_state.get(f"boem_bd_{j}", "(select)")
+            if v and v != "(select)":
+                picked.add(v)
+        boem_opts = ["(select)"] + [lbl for lbl in boem_labels_all if (lbl not in picked) or (lbl == current)]
+        cA, cB = st.columns([1, 1])
+        with cA:
+            st.selectbox("Questionnaire – Field", boem_opts, key=f"boem_bd_{i}",
+                         on_change=_maybe_add_boem_row, args=(i,))
+        with cB:
+            st.selectbox("CSV column", ["(select)"] + list(df.columns), key=f"boem_csv_{i}",
+                         on_change=_maybe_add_boem_row, args=(i,))
+    boem_map: Dict[Tuple[str,str,str,str], str] = {}
+    for i in range(st.session_state.boem_row_count):
+        bd = st.session_state.get(f"boem_bd_{i}", "(select)")
+        csvc = st.session_state.get(f"boem_csv_{i}", "(select)")
+        if bd != "(select)" and csvc != "(select)":
+            boem_map[boem_field_options[bd]] = csvc
+
+    # Title uniqueness
+    if not title_col:
+        st.error("Select a CSV column for **Object Title**."); st.stop()
+    titles_series = df[title_col].astype(str).str.strip()
+    dupes = titles_series[titles_series.duplicated(keep=False) & titles_series.ne("")]
+    if not dupes.empty:
+        sample = dupes.unique()[:10]
+        st.error(f"**Object Title** must be unique. Found {dupes.nunique()} duplicates. Examples: {', '.join(map(str, sample))}")
+        st.stop()
+
+    # ---------------- Step 4 (preview) ----------------
+    st.header("4) Preview")
+    preview_clicked = st.button("Generate preview", key="obj_preview_btn")
+    if preview_clicked:
+        with st.spinner("Retrieving existing objects…"):
+            existing = list_objects(workspace_id, object_def_id)
+
+        by_id = {o["id"]: o for o in existing if "id" in o}
+        by_title = {str((o.get("object_title") or o.get("title"))): o for o in existing if (o.get("object_title") or o.get("title"))}
+
+        def get_detail(stub):
+            try: return get_object(stub["id"])
+            except Exception: return {"id": stub["id"], "object_title": stub.get("object_title") or stub.get("title") or "", "object_properties": [], "boem": []}
+
+        def read_boem(detail):
+            out={}
+            for q in detail.get("boem", []):
+                qid=q.get("id")
+                if not qid: continue
+                out[qid]={it["id"]:str(it.get("value","")) for it in q.get("items", [])}
+            return out
+
+        def read_props_by_name(detail):
+            curr={}
+            for it in detail.get("object_properties", []):
+                pname = it.get("name")
+                if pname: curr[str(pname)] = str(it.get("value",""))
+            return curr
+
+        # Preview columns
+        preview_cols = ["Action","Object_Title","Id"]
+        prop_cols = [f"objectproperty_{name}" for name in prop_map.keys()]
+        preview_cols += prop_cols
+        boem_cols = [f"questionnaire({qname})_{fname}" for (_,_,qname,fname) in boem_map.keys()]
+        preview_cols += boem_cols
+
+        rows, change_rows, invalid_rows, meta = [], [], [], []
+
+        # --- validation helpers ---
+        def _digits_len_ok(val: str, max_digits: int = 16) -> bool:
+            digits = re.findall(r"\d", val or "")
+            return 0 < len(digits) <= max_digits
+
+        def _only_numberish_chars(val: str) -> bool:
+            return re.fullmatch(r"\s*-?[\d.,\s]+\s*", val or "") is not None
+
+        def _validate_value(qid: str, fid: str, raw_val: str) -> bool:
+            cfg = field_config.get((qid, fid), {"type":"text","allowed":set()})
+            t = cfg["type"]; allowed = cfg.get("allowed", set())
+            v = "" if raw_val is None else str(raw_val).strip()
+            if v == "": return True
+            if t == "checkbox": return v in {"Yes", "No"}
+            if t in {"radio", "dropdown_single"}:
+                return (len(allowed)==0) or (v in allowed)
+            if t == "dropdown_multi":
+                parts = [p.strip() for p in str(v).split(multi_value_sep) if p.strip()!=""]
+                if len(allowed)==0: return True
+                return all(p in allowed for p in parts)
+            if t in {"number", "currency"}:
+                if "e" in v.lower(): return False
+                if not _only_numberish_chars(v): return False
+                return _digits_len_ok(v, 16) and (_parse_decimal_like(v) is not None)
+            return True
+
+        def _equivalent(qid: str, fid: str, newv: str, oldv: str) -> bool:
+            cfg = field_config.get((qid, fid), {"type":"text"})
+            c_new = _canon_for_compare(cfg, newv, multi_value_sep)
+            c_old = _canon_for_compare(cfg, oldv, "|")
+            return c_new == c_old
+
+        # Build preview rows
+        for _, r in df.iterrows():
+            title_target = str(r.get(title_col, "")).strip()
+            if not title_target: continue
+            obj_id_val = "" if object_id_col=="(none)" else str(r.get(object_id_col, "")).strip()
+
+            target_props: Dict[str, str] = {pname: ("" if pd.isna(r.get(csvc,"")) else str(r.get(csvc,"")))
+                                            for pname, csvc in prop_map.items()}
+            target_boem: Dict[str, Dict[str, str]] = {}
+            for (qid,fid,qname,fname), csvc in boem_map.items():
+                val = "" if pd.isna(r.get(csvc,"")) else str(r.get(csvc,""))
+                target_boem.setdefault(qid, {})[fid] = val
+
+            stub = by_id.get(obj_id_val) if obj_id_val else by_title.get(title_target)
+            if stub:
+                detail = get_detail(stub)
+                curr_title = str(detail.get("object_title",""))
+                curr_boem = read_boem(detail)
+                curr_props = read_props_by_name(detail)
+
+                row = {"Action":"Update","Object_Title":title_target,"Id":detail["id"]}
+                mask_change = {"Action":False,"Object_Title":(title_target!=curr_title),"Id":False}
+                mask_invalid = {"Action":False,"Object_Title":False,"Id":False}
+                any_change = (title_target!=curr_title)
+
+                # Properties
+                for pname in prop_map.keys():
+                    key = f"objectproperty_{pname}"
+                    newv = target_props.get(pname, "")
+                    oldv = curr_props.get(pname, "")
+                    row[key]=newv
+                    changed = (str(newv)!=str(oldv))
+                    mask_change[key]=changed
+                    mask_invalid[key]=False
+                    any_change |= changed
+
+                # Questionnaires
+                for (qid,fid,qname,fname) in {(q,f,qn,fn) for (q,f,qn,fn) in boem_map.keys()}:
+                    key=f"questionnaire({qname})_{fname}"
+                    newv = target_boem.get(qid, {}).get(fid, "")
+                    oldv = curr_boem.get(qid, {}).get(fid, "")
+                    row[key]=newv
+                    valid = _validate_value(qid,fid,newv)
+                    changed = (not _equivalent(qid,fid,newv,oldv))
+                    mask_change[key]=changed
+                    mask_invalid[key]= (changed and not valid)
+                    any_change |= changed
+
+                if any_change:
+                    rows.append(row); change_rows.append(mask_change); invalid_rows.append(mask_invalid)
+                    # Collect changes for patch
+                    boem_updates: Dict[str, Dict[str,str]] = {}
+                    for (qid,fid,qn,fn), csvc in boem_map.items():
+                        newv = target_boem.get(qid, {}).get(fid, "")
+                        oldv = curr_boem.get(qid, {}).get(fid, "")
+                        if not _equivalent(qid,fid,newv,oldv):
+                            boem_updates.setdefault(qid, {})[fid] = newv
+                    prop_updates = {pname: target_props[pname]
+                                    for pname in prop_map.keys()
+                                    if str(target_props[pname]) != str(curr_props.get(pname, ""))}
+                    meta.append({
+                        "new": False, "id": detail["id"],
+                        "title_update": title_target if (title_target!=curr_title) else None,
+                        "title": title_target,
+                        "boem_updates": boem_updates,
+                        "prop_updates": prop_updates
+                    })
+            else:
+                row={"Action":"Create","Object_Title":title_target,"Id":""}
+                mask_change={"Action":False,"Object_Title":True,"Id":False}
+                mask_invalid={"Action":False,"Object_Title":False,"Id":False}
+                for pname in prop_map.keys():
+                    key=f"objectproperty_{pname}"
+                    v = target_props.get(pname, "")
+                    row[key]=v; mask_change[key]=True; mask_invalid[key]=False
+                for (qid,fid,qname,fname) in boem_map.keys():
+                    key=f"questionnaire({qname})_{fname}"
+                    v = target_boem.get(qid, {}).get(fid, "")
+                    row[key]=v; mask_change[key]=True
+                    mask_invalid[key]= (not _validate_value(qid,fid,v) and v!="")
+                rows.append(row); change_rows.append(mask_change); invalid_rows.append(mask_invalid)
+                meta.append({"new": True,"id":"","title":title_target,"boem":target_boem,"props":target_props})
+
+        if not rows:
+            st.info("Nothing to create or update based on current mapping.")
+        else:
+            preview_df = pd.DataFrame(rows, columns=preview_cols)
+            change_df = pd.DataFrame(False, index=preview_df.index, columns=preview_df.columns)
+            invalid_df = pd.DataFrame(False, index=preview_df.index, columns=preview_df.columns)
+            for i, (mc, mi) in enumerate(zip(change_rows, invalid_rows)):
+                for k, v in mc.items():
+                    if k in change_df.columns: change_df.loc[preview_df.index[i], k] = bool(v)
+                for k, v in mi.items():
+                    if k in invalid_df.columns: invalid_df.loc[preview_df.index[i], k] = bool(v)
+
+            RED_BG, RED_FG   = "#ff8a8a", "#6b0000"      # invalid
+            BLUE_BG, BLUE_FG = "#cfe8ff", "#084298"     # valid change
+            GREEN_BG, GREEN_FG = "#b6f3b6", "#064b2d"   # unchanged
+
+            def style_cell(val, col, idx):
+                if col in ("Action","Id"): return ""
+                inv = bool(invalid_df.loc[idx, col]) if col in invalid_df.columns else False
+                chg = bool(change_df.loc[idx, col]) if col in change_df.columns else False
+                if inv:   bg, fg = RED_BG, RED_FG
+                elif chg: bg, fg = BLUE_BG, BLUE_FG
+                else:     bg, fg = GREEN_BG, GREEN_FG
+                return f"background-color:{bg}; color:{fg}; font-weight:600;"
+
+            styled = preview_df.style.apply(lambda s: [style_cell(v, s.name, s.index[i]) for i, v in enumerate(s)], axis=0)
+            st.dataframe(styled, use_container_width=True)
+
+            st.session_state.preview_df = preview_df
+            st.session_state.preview_mask_change = change_df
+            st.session_state.preview_mask_invalid = invalid_df
+            st.session_state.preview_meta = meta
+            st.session_state.multi_value_sep = multi_value_sep
+
+            invalid_count_preview = int(invalid_df.values.sum())
+            st.success(f"Preview ready: {len(preview_df)} rows • Invalid field values detected: {invalid_count_preview}")
+
+    # ---------------- Step 5 (apply) ----------------
+    st.header("5) Apply changes")
+
+    # Determine invalid count (if preview exists)
+    invalid_count = 0
+    if "preview_mask_invalid" in st.session_state and st.session_state["preview_mask_invalid"] is not None:
+        invalid_count = int(st.session_state["preview_mask_invalid"].values.sum())
+
+    confirm_ok = True
+    if invalid_count > 0:
+        st.warning(
+            f"Some questionnaire values look misconfigured ({invalid_count} cell(s)). "
+            "Applying may result in those fields becoming **empty/undefined** in BlueDolphin."
+        )
+        confirm_ok = st.checkbox(
+            "I understand and want to proceed",
+            key="confirm_apply_invalid",
+            value=st.session_state.get("confirm_apply_invalid", False),
+        )
+
+    apply_disabled = ("preview_df" not in st.session_state) or (invalid_count > 0 and not confirm_ok)
+
+    if st.button("Apply now", disabled=apply_disabled, key="obj_apply_btn"):
+        if "preview_df" not in st.session_state:
+            st.warning("Click **Generate preview** first."); st.stop()
+
+        meta = st.session_state.preview_meta
+        created = updated = errors = 0
+        created_list: List[Tuple[str, str]] = []
+        updated_list: List[Tuple[str, str]] = []
+        logs = []
+        prog = st.progress(0.0, text="Working…")
+        multi_value_sep = st.session_state.get("multi_value_sep","|")
+
+        def boem_payload_from_dict(d: Dict[str, Dict[str,str]]):
+            payload = []
+            for qid, fields in d.items():
+                items = []
+                for fid, val in fields.items():
+                    cfg = field_config.get((qid, fid), {"type":"text"})
+                    items.append({"id": fid, "value": _canon_for_payload(cfg, val, multi_value_sep)})
+                if items: payload.append({"id": qid, "items": items})
+            return payload
+
+        def props_payload_from_dict_namekey(d: Dict[str, str]):
+            return [{"name": pname, "value": v} for pname, v in d.items()]
+
+        def _obj_url(obj_id: str) -> str:
+            return f"https://bluedolphin.app/{tenant}/objects/all/item/{obj_id}"
+
+        for i, item in enumerate(meta):
+            try:
+                if item["new"]:
+                    res = create_object(item["title"], object_def_id, workspace_id)
+                    new_id = res.get("id")
+                    patch_body = {}
+                    if item.get("props"):
+                        patch_body["object_properties"] = props_payload_from_dict_namekey(item["props"])
+                    if item.get("boem"):
+                        patch_body["boem"] = boem_payload_from_dict(item["boem"])
+                    if patch_body:
+                        patch_object(new_id, patch_body)
+                    created += 1
+                    created_list.append((item["title"], new_id))
+                    logs.append(f"Create → \"{item['title']}\" ({new_id})")
+                else:
+                    patch_body = {}
+                    if item.get("title_update"):
+                        patch_body["object_title"] = item["title_update"]
+                    prop_clean = {pname: v for pname, v in (item.get("prop_updates") or {}).items()}
+                    if prop_clean:
+                        patch_body["object_properties"] = props_payload_from_dict_namekey(prop_clean)
+                    boem_clean_src = (item.get("boem_updates") or {})
+                    if boem_clean_src:
+                        patch_body["boem"] = boem_payload_from_dict(boem_clean_src)
+                    if patch_body:
+                        patch_object(item["id"], patch_body)
+                        updated += 1
+                        updated_list.append((item.get("title") or "", item["id"]))
+                        logs.append(f"Update → \"{item.get('title') or ''}\" ({item['id']})")
+            except Exception as e:
+                errors += 1; logs.append(f"ERROR: {e}")
+            prog.progress((i+1)/max(1,len(meta)))
+
+        st.success(f"Done — Created: {created} • Updated: {updated} • Errors: {errors}")
+
+        if created_list:
+            st.subheader("Created")
+            st.markdown("\n".join([f"- **{t}** → [{obj_id}]({_obj_url(obj_id)})" for t, obj_id in created_list]))
+        if updated_list:
+            st.subheader("Updated")
+            st.markdown("\n".join([f"- **{t}** → [{obj_id}]({_obj_url(obj_id)})" for t, obj_id in updated_list]))
+
+        st.code("\n".join(logs), language="text")
+
+    count = st.session_state.get("preview_df").shape[0] if "preview_df" in st.session_state else 0
+    msg = f"Preview shows target values; **green = unchanged**, **blue = valid change**, **red = invalid**. Objects in preview: {count}."
+    if count > 100: msg += " This may take a little while to complete."
+    st.caption(msg)
+
+# ========= RELATIONSHIPS FLOW (from v59 + guard & label) =========
+_obj_rel_cache: Dict[str, dict] = {}
+_rel_detail_cache: Dict[str, dict] = {}
+
+def _get_object_cached(obj_id: str) -> dict:
+    if obj_id not in _obj_rel_cache:
+        _obj_rel_cache[obj_id] = get_object(obj_id)
+    return _obj_rel_cache[obj_id]
+
+def _get_relation_cached(rel_id: str) -> dict:
+    if rel_id not in _rel_detail_cache:
+        _rel_detail_cache[rel_id] = get_relation(rel_id)
+    return _rel_detail_cache[rel_id]
+
+def relation_exists_exact(template_id: str, from_id: str, to_id: str, label: str) -> bool:
+    """True if a relation with same template_id + label already exists in the same direction."""
+    if not (template_id and from_id and to_id):
+        return False
+    try:
+        src = _get_object_cached(from_id)
+    except Exception:
+        return False
+
+    rels = src.get("related_objects", []) or []
+    for r in rels:
+        try:
+            if str(r.get("object_id") or "") != str(to_id):
+                continue
+            tpl = str(
+                (r.get("relationship") or {}).get("template_id")
+                or (r.get("type") or {}).get("id")
+                or ""
+            )
+            if tpl != str(template_id):
+                continue
+            rid = r.get("relationship_id")
+            if not rid:
+                continue
+            det = _get_relation_cached(str(rid))
+            if str(det.get("source_id") or "") != str(from_id):
+                continue
+            if str(det.get("target_id") or "") != str(to_id):
+                continue
+            existing_label = str(det.get("remark") or det.get("label") or "")
+            if existing_label == (label or ""):
+                return True
+        except Exception:
+            continue
+    return False
+
+def relationships_flow():
+    # Block API calls until we have both tenant & key
+    if not tenant or not api_key:
+        st.info("Enter **Tenant** and **API key** in the sidebar to start.")
+        return
+
+    st.header("R1) Pick workspace & definitions")
+
+    try:
+        ws = list_workspaces_cached(API_BASE, tenant, api_key); ws_map = {w["name"]: w["id"] for w in ws}
+    except Exception as e:
+        st.error(e); st.stop()
+    workspace = st.selectbox("Workspace", sorted(ws_map.keys()), key="rel_ws"); workspace_id = ws_map[workspace]
+
+    try:
+        obj_defs = list_object_definitions_cached(API_BASE, tenant, api_key)
+        def_map = {od.get("name", od.get("id")): od["id"] for od in obj_defs}
+    except Exception as e:
+        st.error(e); st.stop()
+
+    col_from, col_to = st.columns(2)
+    with col_from:
+        from_name = st.selectbox("From: Object definition", sorted(def_map.keys()), key="rel_from_def")
+        from_def_id = def_map[from_name]
+    with col_to:
+        to_name = st.selectbox("To: Object definition", sorted(def_map.keys()), key="rel_to_def")
+        to_def_id = def_map[to_name]
+
+    st.info("The API does not expose relationship definitions. Enter the **Relationship Template ID** manually.")
+    tpl_id = st.text_input("Relationship Template ID", key="rel_tpl_manual", placeholder="e.g. 5a00543aec9d264840ae0619").strip()
+
+    st.header("R2) Upload & map CSV / Excel")
+    file = st.file_uploader("Choose file", type=["csv", "xlsx", "xls", "xlsm"], key=f"rel_uploader_{st.session_state.rel_upload_session}")
+    if not file: st.stop()
+
+    def ensure_pkg(pkg: str) -> bool:
+        try:
+            __import__(pkg); return True
+        except ImportError:
+            try:
+                with st.spinner(f"Installing {pkg}…"):
+                    subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+                __import__(pkg); return True
+            except Exception as e:
+                st.error(f"Failed to install {pkg}: {e}"); return False
+
+    try:
+        n = file.name.lower()
+        if n.endswith(".csv"): df = pd.read_csv(file)
+        elif n.endswith((".xlsx", ".xlsm")):
+            if not ensure_pkg("openpyxl"): st.stop()
+            df = pd.read_excel(file, engine="openpyxl")
+        else:
+            if not ensure_pkg("xlrd"): st.stop()
+            df = pd.read_excel(file, engine="xlrd")
+    except Exception as e:
+        st.error(f"Could not read file: {e}"); st.stop()
+    if df.empty:
+        st.error("The uploaded file is empty."); st.stop()
+    df.columns = [str(c) for c in df.columns]
+
+    cols = ["(none)"] + list(df.columns)
+    m1, m2 = st.columns(2)
+    with m1:
+        from_id_col    = st.selectbox("From: Object ID column (optional)", cols, index=0, key="rel_from_id_col")
+        from_title_col = st.selectbox("From: Object Title column (optional)", cols, index=0, key="rel_from_title_col")
+    with m2:
+        to_id_col    = st.selectbox("To: Object ID column (optional)", cols, index=0, key="rel_to_id_col")
+        to_title_col = st.selectbox("To: Object Title column (optional)", cols, index=0, key="rel_to_title_col")
+
+    l1, l2 = st.columns(2)
+    with l1:
+        label_col = st.selectbox("Label (remark) column (optional)", cols, index=0, key="rel_label_col")
+    with l2:
+        lifecycle_col = st.selectbox("Lifecycle column (optional)", cols, index=0, key="rel_lifecycle_col")
+    st.caption("Lifecycle accepted values: **Current** / **Future**")
+
+    st.header("R3) Preview")
+    if st.button("Generate relationship preview", type="primary", key="rel_preview_btn"):
+        # cache lists of objects per definition to resolve titles
+        cache_by_pair: Dict[Tuple[str, str], pd.DataFrame] = {}
+
+        def fetch_objects_df(ws_id: str, def_id: str) -> pd.DataFrame:
+            key = (ws_id, def_id)
+            if key not in cache_by_pair:
+                items = list_objects(ws_id, def_id, take=10000)
+                df_ = pd.DataFrame(items)
+                if "id" not in df_.columns: df_["id"] = None
+                if "title" not in df_.columns:
+                    df_["title"] = df_.get("object_title") if "object_title" in df_.columns else None
+                cache_by_pair[key] = df_[["id", "title"]].copy()
+            return cache_by_pair[key]
+
+        # Resolve IDs from the file
+        resolved_rows = []
+        for _, r in df.iterrows():
+            f_id = "" if from_id_col == "(none)" else str(r.get(from_id_col) or "").strip()
+            t_id = "" if to_id_col == "(none)" else str(r.get(to_id_col) or "").strip()
+            f_title = "" if from_title_col == "(none)" else str(r.get(from_title_col) or "").strip()
+            t_title = "" if to_title_col == "(none)" else str(r.get(to_title_col) or "").strip()
+            lbl = "" if label_col == "(none)" else str(r.get(label_col) or "").strip()
+            life = "" if lifecycle_col == "(none)" else str(r.get(lifecycle_col) or "").strip()
+
+            if not f_id and f_title:
+                df_from = fetch_objects_df(workspace_id, from_def_id)
+                match = df_from[df_from["title"] == f_title]
+                if len(match) == 1: f_id = match.iloc[0]["id"]
+            if not t_id and t_title:
+                df_to = fetch_objects_df(workspace_id, to_def_id)
+                match = df_to[df_to["title"] == t_title]
+                if len(match) == 1: t_id = match.iloc[0]["id"]
+
+            resolved_rows.append({
+                "from_id": f_id, "from_title": f_title,
+                "to_id": t_id, "to_title": t_title,
+                "label": lbl, "lifecycle": life
+            })
+
+        # Config duplicate guard: (from,to,label) or (from,to) if no label column
+        dup_counts: Dict[Tuple, int] = {}
+        for rr in resolved_rows:
+            key = (rr["from_id"], rr["to_id"]) if label_col == "(none)" else (rr["from_id"], rr["to_id"], rr["label"])
+            dup_counts[key] = dup_counts.get(key, 0) + 1
+        dups = [k for k, c in dup_counts.items() if c > 1 and (k[0] or k[1])]
+        if dups:
+            examples = []
+            for k in dups[:5]:
+                if label_col == "(none)":
+                    examples.append(f"from={k[0] or '(missing)'} → to={k[1] or '(missing)'}")
+                else:
+                    examples.append(f"from={k[0] or '(missing)'} → to={k[1] or '(missing)'} [label={k[2] or '(empty)'}]")
+            st.error(
+                "Your file contains duplicate relationship combinations. "
+                "Each (from, to, label) must be unique "
+                "(or (from, to) when no label column is selected).\n\n"
+                "Examples:\n- " + "\n- ".join(examples)
+            )
+            st.stop()
+
+        # Build preview with existence check using related_objects + relations/{id}
+        rows = []
+        for rr in resolved_rows:
+            f_id = rr["from_id"]; t_id = rr["to_id"]; lbl = rr["label"]; life = rr["lifecycle"]
+            errs = []
+            if not tpl_id: errs.append("Template ID missing")
+            missing_ft = (not f_id) or (not t_id)
+
+            exists = False
+            if not missing_ft and not errs:
+                try:
+                    exists = relation_exists_exact(
+                        template_id=str(tpl_id).strip(),
+                        from_id=str(f_id).strip(),
+                        to_id=str(t_id).strip(),
+                        label=(lbl or "").strip()
+                    )
+                except Exception:
+                    exists = False
+
+            if missing_ft:
+                action = "Skip: missing object"
+            else:
+                action = "Skip (exists)" if exists else "Create"
+
+            rows.append({
+                "Action": action,
+                "From_Title": rr["from_title"],
+                "From_ID": f_id,
+                "To_Title": rr["to_title"],
+                "To_ID": t_id,
+                "Template_ID": tpl_id,
+                "Label": lbl,
+                "Lifecycle": life,
+                "Error": "; ".join(errs)
+            })
+
+        rel_prev = pd.DataFrame(rows)
+
+        def style_row(row):
+            styles = []
+            for col in rel_prev.columns:
+                bad = False
+                if col in ("From_ID", "To_ID", "Template_ID"):
+                    bad = not str(row[col]).strip()
+                if col == "Error" and str(row[col]).strip():
+                    bad = True
+                if str(row["Action"]).lower().startswith("skip"):
+                    styles.append("background-color:#efefef; color:#333; font-weight:600;")
+                else:
+                    bg = "#a9f0a9" if not bad else "#ff9a9a"
+                    styles.append(f"background-color:{bg};")
+            return styles
+
+        st.dataframe(rel_prev.style.apply(lambda r: style_row(r), axis=1), use_container_width=True)
+        st.session_state["rel_prev"] = rel_prev
+        st.success(f"Preview ready: {len(rel_prev)} relationships")
+
+    # Apply
+    st.header("R4) Apply relationships")
+    if st.button("Apply relationships", key="rel_apply_btn", disabled=("rel_prev" not in st.session_state)):
+        if "rel_prev" not in st.session_state:
+            st.warning("Click **Generate relationship preview** first."); st.stop()
+        rel_prev = st.session_state["rel_prev"]
+        to_create = rel_prev[rel_prev["Action"] == "Create"]
+        if to_create.empty:
+            st.info("Nothing to create."); st.stop()
+
+        created = 0; errors = 0
+        created_from_ids: set = set()
+        prog = st.progress(0.0, text="Creating…")
+
+        for i, row in to_create.reset_index(drop=True).iterrows():
+            try:
+                res = post_relationship(
+                    template_id=str(row["Template_ID"]).strip(),
+                    from_id=str(row["From_ID"]).strip(),
+                    to_id=str(row["To_ID"]).strip(),
+                    label=str(row["Label"]).strip() if str(row["Label"]).strip() else None,
+                    lifecycle=(str(row["Lifecycle"]).strip() or None)
+                )
+                created += 1
+                created_from_ids.add(str(row["From_ID"]).strip())
+            except Exception as e:
+                errors += 1
+                if _is_logging():
+                    _log("error", f"POST /relations failed: {e}")
+            prog.progress((i+1)/max(1, len(to_create)))
+
+        st.success(f"Done — Created: {created} • Errors: {errors} • Skipped were shown in preview")
+
+        if created_from_ids:
+            st.subheader("Quick links to Relations tab (FROM objects)")
+            lines = []
+            for oid in sorted(created_from_ids):
+                url = f"https://bluedolphin.app/{tenant}/objects/all/item/{oid}/relations"
+                lines.append(f"- [{oid}]({url})")
+            st.markdown("\n".join(lines))
+
+# ---------------- Main router ----------------
+# Guard at the top-level: show a friendly message before any API calls happen.
+if not tenant or not api_key:
+    st.info("Enter **Tenant** and **API key** in the sidebar to begin.")
+else:
+    if mode == "Objects":
+        objects_flow()
+    else:
+        relationships_flow()
