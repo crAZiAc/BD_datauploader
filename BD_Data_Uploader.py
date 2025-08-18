@@ -1,10 +1,14 @@
-# BD_Data_Uploader_v0_9.py
+# BD_Data_Uploader_v0_93.py
 # Streamlit app to upload/update BlueDolphin objects + create relationships
-# v0.9 = v56 Objects flow kept; Relationships from v59 (dedupe, label), plus:
-#   - POST /relations uses "label"
-#   - No API calls until tenant & x-api-key are provided
-#   - Logging panel (toggle successes), retry on 429 with countdown, CSV & multiselect separators,
-#     object property mapping by name, questionnaire validation, styled preview
+# v0.93:
+#   - Relationships preview: keep the FIRST (from_id,to_id[,label]) and mark all later
+#     duplicates as "Skip: duplicate". First one still checks/obeys "Skip (exists)" and
+#     "Skip: missing object".
+#   - "Create" rows render with black text.
+# v0.92:
+#   - Added black text for Create rows; preview allowed but skipped all duplicates
+# v0.91:
+#   - Objects: optional Lifecycle, validation & preview coloring
 
 import json, time, sys, subprocess, datetime, re
 from email.utils import parsedate_to_datetime
@@ -15,7 +19,9 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="BlueDolphin Uploader v0.9", layout="wide")
+ALLOWED_LIFECYCLE = {"Current", "Future"}
+
+st.set_page_config(page_title="BlueDolphin Uploader v0.93", layout="wide")
 st.title("BlueDolphin CSV/Excel Uploader")
 
 # ---------------- Sidebar: connection + mode ----------------
@@ -40,7 +46,7 @@ with st.sidebar:
         for k in ("prop_row_count","boem_row_count","preview_df","preview_mask_change","preview_mask_invalid",
                   "preview_meta","multi_value_sep","rel_prev","rel_ctx",
                   "obj_csvsep_choice","obj_csvsep_custom","obj_vsep_choice","obj_vsep_custom",
-                  "map_title","map_id","confirm_apply_invalid"):
+                  "map_title","map_id","map_lifecycle","confirm_apply_invalid"):
             st.session_state.pop(k, None)
         st.session_state["obj_upload_session"] = st.session_state.get("obj_upload_session", 0) + 1
         st.session_state["rel_upload_session"] = st.session_state.get("rel_upload_session", 0) + 1
@@ -60,40 +66,47 @@ for k, v in [
 ]:
     if k not in st.session_state: st.session_state[k] = v
 
-# ---------------- Help (sidebar) ----------------
-with st.sidebar.expander("Help: API key, tenant & rules", expanded=False):
-    st.markdown(
-        """
-**What key do I need?**  
-Use a **User API key** (inherits your own permissions). Treat it like a password.
+# ---------- Help (sidebar) ----------
+def render_help():
+    with st.sidebar.expander("Help: API key, tenant & rules", expanded=False):
+        st.markdown(
+            """
+**API key & tenant**
+- Use a **User API key** (inherits your permissions). Treat it like a password.
+- Where do I get it? See the **Quick Start Guide** (steps to create a user API key).
+- **Tenant** = the part after **bluedolphin.app/**. Example: https://bluedolphin.app/mytenant → tenant = **mytenant**.
 
-**Where do I get it?**  
-See the **Quick Start Guide** (has steps to create a user API key).  
-**Tenant** = the part after `bluedolphin.app/`.  
-Example: `https://bluedolphin.app/mytenant` → tenant = `mytenant`.
+**Objects — how it works**
+- **Title** is required and must be **unique in your file**.
+- **Object ID** (optional). If present, we update by ID; otherwise we match by Title.
+- **Lifecycle** (optional): **Current** or **Future**. Empty = ignored; invalid values are flagged.
+- **Questionnaires**
+  - **Dropdown/Radio**: use one of the listed options.
+  - **Multiselect**: set your file’s separator in the UI; we convert to `|` automatically.
+  - **Checkbox**: only **Yes** or **No** (case-sensitive).
+  - **Numbers/Currency**: up to **16 digits**; decimals `.` or `,`; scientific notation (like `1.2E+26`) is **not allowed**.
+- **Preview colours**
+  - 🟩 **green** = no change
+  - 🔵 **blue** = will change
+  - 🟥 **red** = invalid (will be sent as empty/undefined if you proceed)
+- **Large uploads**: if the preview shows **>100** objects, applying can take longer.
+- **Rate limits**: if we need to slow down, the app shows a countdown and retries automatically.
+
+**Relationships — how it works**
+- **Relationship template ID**: enter the ID manually (the API doesn’t list them).
+- **From / To**: pick the definitions and map IDs or Titles.
+- **Existing check**: we **skip** creating a relation if one already exists with the same **from**, **to**, **relationship type**, **direction**, and **label**.
+- **Label**: optional free text attached to the relation.
+- **Lifecycle** (optional): Current or Future.
+- After apply, links to the **Relations** tab of each “from” object are shown.
 """
-    )
-    st.link_button(
-        "Open Quick Start Guide",
-        "https://support.valueblue.nl/hc/en-us/articles/13296899552668-Quick-Start-Guide"
-    )
-    st.divider()
-    st.markdown(
-        """
-### Business rules used by this app
-- **Title** must be unique per upload.
-- **Dropdown / Radio**: value must match one of the configured options.
-- **Multiselect**: if present, choose the file separator; comparison ignores order; payload uses `|`.
-- **Checkbox**: only `Yes` or `No` (case-sensitive).
-- **Number/Currency**:
-  - Up to **16 digits** total; thousands separators ok; decimal may be `.` or `,`.
-  - **Scientific notation** like `1.23E+26` is **not accepted** (flagged invalid).
-  - Preview equality ignores **trailing zeros** (e.g., `1.0` ≡ `1.000`).
-  - Values are sent with a `.` decimal separator and rounded to the field’s configured decimals when known.
-- **Object properties** are set by **name** (no validation metadata available).
-- **Preview colors**: green = unchanged, blue = valid change, red = invalid value.
-"""
-    )
+        )
+        st.link_button(
+            "Open Quick Start Guide",
+            "https://support.valueblue.nl/hc/en-us/articles/13296899552668-Quick-Start-Guide",
+        )
+
+render_help()
 
 # ---------------- Advanced (sidebar): logging + cache ----------------
 with st.sidebar.expander("Advanced", expanded=False):
@@ -118,7 +131,7 @@ with st.sidebar.expander("Advanced", expanded=False):
             if entry["level"] in ("ok", "info") and not show_ok:
                 continue
             filtered.append(entry)
-        filtered = filtered[:20]  # latest first, show 20 lines
+        filtered = filtered[:20]
         html_lines = []
         for e in filtered:
             color = "#B00020" if e["level"] == "error" else ("#666" if e["level"] == "info" else "#1f4b2e")
@@ -249,8 +262,11 @@ def list_objects(workspace_id: str, object_def_id: str, take: int = 2000):
 def get_object(obj_id: str):              return get_json(f"/objects/{obj_id}")
 def get_object_definition(def_id: str):   return get_json(f"/object-definitions/{def_id}")
 def get_questionnaire(q_id: str):         return get_json(f"/questionnaires/{q_id}")
-def create_object(title: str, object_def_id: str, workspace_id: str):
-    return post_json("/objects", {"object_title": title, "object_type_id": object_def_id, "workspace_id": workspace_id})
+def create_object(title: str, object_def_id: str, workspace_id: str, lifecycle: Optional[str] = None):
+    body = {"object_title": title, "object_type_id": object_def_id, "workspace_id": workspace_id}
+    if lifecycle in ALLOWED_LIFECYCLE:
+        body["object_lifecycle_state"] = lifecycle
+    return post_json("/objects", body)
 def patch_object(obj_id: str, body: Dict): return patch_json(f"/objects/{obj_id}", body)
 
 # -------- Relationships API --------
@@ -264,7 +280,7 @@ def post_relationship(template_id: str, from_id: str, to_id: str, label: Optiona
         "to_object_id": to_id,
     }
     if label:
-        body["label"] = str(label)  # <-- use 'label' on POST
+        body["label"] = str(label)
     if lifecycle in {"Current", "Future"}:
         body["relationship_lifecycle_state"] = lifecycle
     return post_json("/relations", body)
@@ -332,17 +348,16 @@ def _classify_type(ft: str) -> str:
     return "text"
 
 def _parse_decimal_like(s: str) -> Optional[Decimal]:
-    """Parse numbers but reject scientific notation as invalid for BD rules."""
     if s is None: return None
     v = str(s).strip()
     if v == "": return None
-    if "e" in v.lower(): return None  # explicitly reject sci-notation
+    if "e" in v.lower(): return None
     v = v.replace(" ", "")
     dot = v.rfind("."); com = v.rfind(",")
     if dot != -1 and com != -1:
-        if dot > com:  # '.' is decimal
+        if dot > com:
             v = v.replace(",", "")
-        else:          # ',' is decimal
+        else:
             v = v.replace(".", "")
             v = v.replace(",", ".")
     else:
@@ -358,11 +373,11 @@ def _quantize(d: Decimal, decimals: Optional[int]) -> Decimal:
     q = Decimal(10) ** -decimals
     return d.quantize(q, rounding=ROUND_HALF_UP)
 
-def _canon_for_compare(cfg: Dict, raw_val: str, multi_sep: str) -> str:
+def _canon_for_compare(cfg: Dict, raw_val: str, multi_value_sep: str) -> str:
     typ = cfg.get("type","text")
     if typ == "dropdown_multi":
         if raw_val is None: return ""
-        parts = [p.strip() for p in str(raw_val).split(multi_sep) if str(p).strip()!=""]
+        parts = [p.strip() for p in str(raw_val).split(multi_value_sep) if str(p).strip()!=""]
         return "|".join(sorted(parts))
     if typ in {"number","currency"}:
         d = _parse_decimal_like(raw_val)
@@ -371,11 +386,11 @@ def _canon_for_compare(cfg: Dict, raw_val: str, multi_sep: str) -> str:
         return f"{d:f}"
     return "" if raw_val is None else str(raw_val).strip()
 
-def _canon_for_payload(cfg: Dict, raw_val: str, multi_sep: str) -> str:
+def _canon_for_payload(cfg: Dict, raw_val: str, multi_value_sep: str) -> str:
     typ = cfg.get("type","text")
     if raw_val is None: return ""
     if typ == "dropdown_multi":
-        parts = [p.strip() for p in str(raw_val).split(multi_sep) if str(p).strip()!=""]
+        parts = [p.strip() for p in str(raw_val).split(multi_value_sep) if str(p).strip()!=""]
         return "|".join(parts)
     if typ in {"number","currency"}:
         d = _parse_decimal_like(raw_val)
@@ -388,14 +403,12 @@ def _canon_for_payload(cfg: Dict, raw_val: str, multi_sep: str) -> str:
         return f"{d:f}"
     return str(raw_val).strip()
 
-# ========= OBJECTS FLOW (kept as v56) =========
+# ========= OBJECTS FLOW =========
 def objects_flow():
-    # Block API calls until we have both tenant & key
     if not tenant or not api_key:
         st.info("Enter **Tenant** and **API key** in the sidebar to start.")
         return
 
-    # ---------------- Step 1 ----------------
     st.header("1) Pick workspace & object definition")
     try:
         ws = list_workspaces_cached(API_BASE, tenant, api_key); ws_map = {w["name"]: w["id"] for w in ws}
@@ -425,7 +438,6 @@ def objects_flow():
     up = st.file_uploader("Choose file", type=["csv", "xlsx", "xls", "xlsm"], key=f"obj_uploader_{st.session_state.obj_upload_session}")
     if not up: st.stop()
 
-    # ----- CSV/Excel reading + CSV options -----
     is_csv = up.name.lower().endswith(".csv")
     csv_col_sep = None
 
@@ -466,7 +478,6 @@ def objects_flow():
     with st.spinner("Loading questionnaires & properties…"):
         definition = get_object_definition(object_def_id)
 
-        # Questionnaires
         related_boem = definition.get("related_boem") or []
         questionnaires = []
         for q in related_boem:
@@ -475,14 +486,12 @@ def objects_flow():
             except Exception:
                 pass
 
-        # Object properties by NAME
         prop_names = _extract_property_names_from_definition(definition)
         if not prop_names:
             prop_names = _discover_property_names_from_objects(workspace_id, object_def_id, sample=10)
         if _is_logging():
             _log("info", f"object_properties discovered (by name): {len(prop_names)}")
 
-    # Build selectable questionnaire fields + configs
     boem_field_options: Dict[str, Tuple[str, str, str, str]] = {}
     field_config: Dict[Tuple[str, str], Dict] = {}
     has_multi = False
@@ -492,7 +501,7 @@ def objects_flow():
         for f in q.get("fields", []):
             ftype_raw = f.get("field_type") or f.get("type") or ""
             ftype = _classify_type(ftype_raw)
-            if (ftype_raw or "").lower() == "relation":  # ignore relation fields
+            if (ftype_raw or "").lower() == "relation":
                 continue
             fid = f.get("id"); fname = f.get("name"); qid = q.get("id")
             label = f"{qname} – {fname}"
@@ -515,7 +524,6 @@ def objects_flow():
                 "decimals": f.get("number_of_decimals", None) if ftype in {"number","currency"} else None
             }
 
-    # Multi-select value separator — only if there *are* multi-select fields
     if has_multi:
         with st.expander("Multi-select value separator", expanded=True):
             vsep_choice = st.selectbox(
@@ -531,7 +539,7 @@ def objects_flow():
     else:
         multi_value_sep = "|"
 
-    # Title + ID mapping
+    # Title + ID + Lifecycle mapping
     c1, c2 = st.columns([1, 1])
     with c1: st.markdown("**Object Title (required)**")
     with c2: title_col = st.selectbox("CSV column for title", list(df.columns), key="map_title", label_visibility="collapsed")
@@ -540,14 +548,17 @@ def objects_flow():
     with c3: st.markdown("Object ID (optional)")
     with c4: object_id_col = st.selectbox("CSV column for object_id", ["(none)"] + list(df.columns), key="map_id", label_visibility="collapsed")
 
-    # Object properties (by NAME) — prevent duplicates across rows (hide picks from earlier rows only)
+    c5, c6 = st.columns([1, 1])
+    with c5: st.markdown("Lifecycle (optional)")
+    with c6: lifecycle_col = st.selectbox("CSV column for lifecycle", ["(none)"] + list(df.columns), key="map_lifecycle", label_visibility="collapsed")
+
+    # Object properties (by NAME)
     st.divider(); st.subheader("Object properties (optional)")
     for i in range(st.session_state.prop_row_count):
         current = st.session_state.get(f"prop_bd_{i}", "(select)")
         picked = set()
         for j in range(st.session_state.prop_row_count):
-            if j >= i:  # only earlier rows
-                continue
+            if j >= i: continue
             v = st.session_state.get(f"prop_bd_{j}", "(select)")
             if v and v != "(select)":
                 picked.add(v)
@@ -565,15 +576,14 @@ def objects_flow():
         csvc = st.session_state.get(f"prop_csv_{i}", "(select)")
         if bd != "(select)" and csvc != "(select)": prop_map[bd] = csvc
 
-    # Questionnaires — prevent duplicates across rows (hide picks from earlier rows only)
+    # Questionnaires
     st.divider(); st.subheader("Questionnaires (optional)")
     boem_labels_all = list(boem_field_options.keys())
     for i in range(st.session_state.boem_row_count):
         current = st.session_state.get(f"boem_bd_{i}", "(select)")
         picked = set()
         for j in range(st.session_state.boem_row_count):
-            if j >= i:  # only earlier rows
-                continue
+            if j >= i: continue
             v = st.session_state.get(f"boem_bd_{j}", "(select)")
             if v and v != "(select)":
                 picked.add(v)
@@ -619,7 +629,7 @@ def objects_flow():
         def read_boem(detail):
             out={}
             for q in detail.get("boem", []):
-                qid=q.get("id")
+                qid=q.get("id"); 
                 if not qid: continue
                 out[qid]={it["id"]:str(it.get("value","")) for it in q.get("items", [])}
             return out
@@ -631,8 +641,7 @@ def objects_flow():
                 if pname: curr[str(pname)] = str(it.get("value",""))
             return curr
 
-        # Preview columns
-        preview_cols = ["Action","Object_Title","Id"]
+        preview_cols = ["Action","Object_Title","Id","Lifecycle"]
         prop_cols = [f"objectproperty_{name}" for name in prop_map.keys()]
         preview_cols += prop_cols
         boem_cols = [f"questionnaire({qname})_{fname}" for (_,_,qname,fname) in boem_map.keys()]
@@ -640,14 +649,11 @@ def objects_flow():
 
         rows, change_rows, invalid_rows, meta = [], [], [], []
 
-        # --- validation helpers ---
         def _digits_len_ok(val: str, max_digits: int = 16) -> bool:
             digits = re.findall(r"\d", val or "")
             return 0 < len(digits) <= max_digits
-
         def _only_numberish_chars(val: str) -> bool:
             return re.fullmatch(r"\s*-?[\d.,\s]+\s*", val or "") is not None
-
         def _validate_value(qid: str, fid: str, raw_val: str) -> bool:
             cfg = field_config.get((qid, fid), {"type":"text","allowed":set()})
             t = cfg["type"]; allowed = cfg.get("allowed", set())
@@ -665,18 +671,20 @@ def objects_flow():
                 if not _only_numberish_chars(v): return False
                 return _digits_len_ok(v, 16) and (_parse_decimal_like(v) is not None)
             return True
-
         def _equivalent(qid: str, fid: str, newv: str, oldv: str) -> bool:
             cfg = field_config.get((qid, fid), {"type":"text"})
             c_new = _canon_for_compare(cfg, newv, multi_value_sep)
             c_old = _canon_for_compare(cfg, oldv, "|")
             return c_new == c_old
 
-        # Build preview rows
+        # ---- v0.93 duplicate handling: keep first, skip later ----
+        seen_keys = set()
+
         for _, r in df.iterrows():
             title_target = str(r.get(title_col, "")).strip()
             if not title_target: continue
             obj_id_val = "" if object_id_col=="(none)" else str(r.get(object_id_col, "")).strip()
+            life_raw = "" if lifecycle_col=="(none)" else str(r.get(lifecycle_col, "") or "").strip()
 
             target_props: Dict[str, str] = {pname: ("" if pd.isna(r.get(csvc,"")) else str(r.get(csvc,"")))
                                             for pname, csvc in prop_map.items()}
@@ -686,18 +694,34 @@ def objects_flow():
                 target_boem.setdefault(qid, {})[fid] = val
 
             stub = by_id.get(obj_id_val) if obj_id_val else by_title.get(title_target)
+
+            # Build duplicate key only when both IDs are known (after resolving)
+            curr_id = ""
             if stub:
+                curr_id = stub["id"]
+            key_for_dupes = None  # (from_id,to_id[,label]) is only for relationships (below)
+
+            if stub:
+                # --- Update path (same as before) ---
                 detail = get_detail(stub)
                 curr_title = str(detail.get("object_title",""))
                 curr_boem = read_boem(detail)
                 curr_props = read_props_by_name(detail)
+                curr_life = str(detail.get("object_lifecycle_state","") or "")
 
-                row = {"Action":"Update","Object_Title":title_target,"Id":detail["id"]}
-                mask_change = {"Action":False,"Object_Title":(title_target!=curr_title),"Id":False}
-                mask_invalid = {"Action":False,"Object_Title":False,"Id":False}
+                row = {"Action":"Update","Object_Title":title_target,"Id":detail["id"],"Lifecycle":life_raw}
+                mask_change = {"Action":False,"Object_Title":(title_target!=curr_title),"Id":False,"Lifecycle":False}
+                mask_invalid = {"Action":False,"Object_Title":False,"Id":False,"Lifecycle":False}
                 any_change = (title_target!=curr_title)
 
-                # Properties
+                if life_raw != "":
+                    if life_raw not in ALLOWED_LIFECYCLE:
+                        mask_invalid["Lifecycle"] = True
+                    else:
+                        chg_life = (life_raw != curr_life)
+                        mask_change["Lifecycle"] = chg_life
+                        any_change |= chg_life
+
                 for pname in prop_map.keys():
                     key = f"objectproperty_{pname}"
                     newv = target_props.get(pname, "")
@@ -708,7 +732,6 @@ def objects_flow():
                     mask_invalid[key]=False
                     any_change |= changed
 
-                # Questionnaires
                 for (qid,fid,qname,fname) in {(q,f,qn,fn) for (q,f,qn,fn) in boem_map.keys()}:
                     key=f"questionnaire({qname})_{fname}"
                     newv = target_boem.get(qid, {}).get(fid, "")
@@ -722,7 +745,6 @@ def objects_flow():
 
                 if any_change:
                     rows.append(row); change_rows.append(mask_change); invalid_rows.append(mask_invalid)
-                    # Collect changes for patch
                     boem_updates: Dict[str, Dict[str,str]] = {}
                     for (qid,fid,qn,fn), csvc in boem_map.items():
                         newv = target_boem.get(qid, {}).get(fid, "")
@@ -732,17 +754,20 @@ def objects_flow():
                     prop_updates = {pname: target_props[pname]
                                     for pname in prop_map.keys()
                                     if str(target_props[pname]) != str(curr_props.get(pname, ""))}
+                    lifecycle_update = life_raw if (life_raw in ALLOWED_LIFECYCLE and life_raw != curr_life) else None
                     meta.append({
                         "new": False, "id": detail["id"],
                         "title_update": title_target if (title_target!=curr_title) else None,
                         "title": title_target,
                         "boem_updates": boem_updates,
-                        "prop_updates": prop_updates
+                        "prop_updates": prop_updates,
+                        "lifecycle_update": lifecycle_update
                     })
             else:
-                row={"Action":"Create","Object_Title":title_target,"Id":""}
-                mask_change={"Action":False,"Object_Title":True,"Id":False}
-                mask_invalid={"Action":False,"Object_Title":False,"Id":False}
+                # --- Create path (same as before) ---
+                row={"Action":"Create","Object_Title":title_target,"Id":"","Lifecycle":life_raw}
+                mask_change={"Action":False,"Object_Title":True,"Id":False,"Lifecycle": (life_raw != "" and life_raw in ALLOWED_LIFECYCLE)}
+                mask_invalid={"Action":False,"Object_Title":False,"Id":False,"Lifecycle": (life_raw != "" and life_raw not in ALLOWED_LIFECYCLE)}
                 for pname in prop_map.keys():
                     key=f"objectproperty_{pname}"
                     v = target_props.get(pname, "")
@@ -751,9 +776,10 @@ def objects_flow():
                     key=f"questionnaire({qname})_{fname}"
                     v = target_boem.get(qid, {}).get(fid, "")
                     row[key]=v; mask_change[key]=True
-                    mask_invalid[key]= (not _validate_value(qid,fid,v) and v!="")
+                    mask_invalid[key]= (v!="" and not _validate_value(qid,fid,v))
                 rows.append(row); change_rows.append(mask_change); invalid_rows.append(mask_invalid)
-                meta.append({"new": True,"id":"","title":title_target,"boem":target_boem,"props":target_props})
+                lifecycle_val = life_raw if life_raw in ALLOWED_LIFECYCLE else None
+                meta.append({"new": True,"id":"","title":title_target,"boem":target_boem,"props":target_props,"lifecycle": lifecycle_val})
 
         if not rows:
             st.info("Nothing to create or update based on current mapping.")
@@ -767,9 +793,9 @@ def objects_flow():
                 for k, v in mi.items():
                     if k in invalid_df.columns: invalid_df.loc[preview_df.index[i], k] = bool(v)
 
-            RED_BG, RED_FG   = "#ff8a8a", "#6b0000"      # invalid
-            BLUE_BG, BLUE_FG = "#cfe8ff", "#084298"     # valid change
-            GREEN_BG, GREEN_FG = "#b6f3b6", "#064b2d"   # unchanged
+            RED_BG, RED_FG   = "#ff8a8a", "#6b0000"
+            BLUE_BG, BLUE_FG = "#cfe8ff", "#084298"
+            GREEN_BG, GREEN_FG = "#b6f3b6", "#064b2d"
 
             def style_cell(val, col, idx):
                 if col in ("Action","Id"): return ""
@@ -795,7 +821,6 @@ def objects_flow():
     # ---------------- Step 5 (apply) ----------------
     st.header("5) Apply changes")
 
-    # Determine invalid count (if preview exists)
     invalid_count = 0
     if "preview_mask_invalid" in st.session_state and st.session_state["preview_mask_invalid"] is not None:
         invalid_count = int(st.session_state["preview_mask_invalid"].values.sum())
@@ -803,7 +828,7 @@ def objects_flow():
     confirm_ok = True
     if invalid_count > 0:
         st.warning(
-            f"Some questionnaire values look misconfigured ({invalid_count} cell(s)). "
+            f"Some questionnaire/lifecycle values look misconfigured ({invalid_count} cell(s)). "
             "Applying may result in those fields becoming **empty/undefined** in BlueDolphin."
         )
         confirm_ok = st.checkbox(
@@ -845,7 +870,7 @@ def objects_flow():
         for i, item in enumerate(meta):
             try:
                 if item["new"]:
-                    res = create_object(item["title"], object_def_id, workspace_id)
+                    res = create_object(item["title"], object_def_id, workspace_id, lifecycle=item.get("lifecycle"))
                     new_id = res.get("id")
                     patch_body = {}
                     if item.get("props"):
@@ -867,6 +892,9 @@ def objects_flow():
                     boem_clean_src = (item.get("boem_updates") or {})
                     if boem_clean_src:
                         patch_body["boem"] = boem_payload_from_dict(boem_clean_src)
+                    life_upd = item.get("lifecycle_update")
+                    if life_upd in ALLOWED_LIFECYCLE:
+                        patch_body["object_lifecycle_state"] = life_upd
                     if patch_body:
                         patch_object(item["id"], patch_body)
                         updated += 1
@@ -892,7 +920,7 @@ def objects_flow():
     if count > 100: msg += " This may take a little while to complete."
     st.caption(msg)
 
-# ========= RELATIONSHIPS FLOW (from v59 + guard & label) =========
+# ========= RELATIONSHIPS FLOW =========
 _obj_rel_cache: Dict[str, dict] = {}
 _rel_detail_cache: Dict[str, dict] = {}
 
@@ -907,7 +935,6 @@ def _get_relation_cached(rel_id: str) -> dict:
     return _rel_detail_cache[rel_id]
 
 def relation_exists_exact(template_id: str, from_id: str, to_id: str, label: str) -> bool:
-    """True if a relation with same template_id + label already exists in the same direction."""
     if not (template_id and from_id and to_id):
         return False
     try:
@@ -943,7 +970,6 @@ def relation_exists_exact(template_id: str, from_id: str, to_id: str, label: str
     return False
 
 def relationships_flow():
-    # Block API calls until we have both tenant & key
     if not tenant or not api_key:
         st.info("Enter **Tenant** and **API key** in the sidebar to start.")
         return
@@ -1016,12 +1042,12 @@ def relationships_flow():
     with l1:
         label_col = st.selectbox("Label (remark) column (optional)", cols, index=0, key="rel_label_col")
     with l2:
-        lifecycle_col = st.selectbox("Lifecycle column (optional)", cols, index=0, key="rel_lifecycle_col")
+        lifecycle_col_rel = st.selectbox("Lifecycle column (optional)", cols, index=0, key="rel_lifecycle_col")
     st.caption("Lifecycle accepted values: **Current** / **Future**")
 
     st.header("R3) Preview")
+
     if st.button("Generate relationship preview", type="primary", key="rel_preview_btn"):
-        # cache lists of objects per definition to resolve titles
         cache_by_pair: Dict[Tuple[str, str], pd.DataFrame] = {}
 
         def fetch_objects_df(ws_id: str, def_id: str) -> pd.DataFrame:
@@ -1035,7 +1061,6 @@ def relationships_flow():
                 cache_by_pair[key] = df_[["id", "title"]].copy()
             return cache_by_pair[key]
 
-        # Resolve IDs from the file
         resolved_rows = []
         for _, r in df.iterrows():
             f_id = "" if from_id_col == "(none)" else str(r.get(from_id_col) or "").strip()
@@ -1043,7 +1068,7 @@ def relationships_flow():
             f_title = "" if from_title_col == "(none)" else str(r.get(from_title_col) or "").strip()
             t_title = "" if to_title_col == "(none)" else str(r.get(to_title_col) or "").strip()
             lbl = "" if label_col == "(none)" else str(r.get(label_col) or "").strip()
-            life = "" if lifecycle_col == "(none)" else str(r.get(lifecycle_col) or "").strip()
+            life = "" if lifecycle_col_rel == "(none)" else str(r.get(lifecycle_col_rel) or "").strip()
 
             if not f_id and f_title:
                 df_from = fetch_objects_df(workspace_id, from_def_id)
@@ -1060,28 +1085,9 @@ def relationships_flow():
                 "label": lbl, "lifecycle": life
             })
 
-        # Config duplicate guard: (from,to,label) or (from,to) if no label column
-        dup_counts: Dict[Tuple, int] = {}
-        for rr in resolved_rows:
-            key = (rr["from_id"], rr["to_id"]) if label_col == "(none)" else (rr["from_id"], rr["to_id"], rr["label"])
-            dup_counts[key] = dup_counts.get(key, 0) + 1
-        dups = [k for k, c in dup_counts.items() if c > 1 and (k[0] or k[1])]
-        if dups:
-            examples = []
-            for k in dups[:5]:
-                if label_col == "(none)":
-                    examples.append(f"from={k[0] or '(missing)'} → to={k[1] or '(missing)'}")
-                else:
-                    examples.append(f"from={k[0] or '(missing)'} → to={k[1] or '(missing)'} [label={k[2] or '(empty)'}]")
-            st.error(
-                "Your file contains duplicate relationship combinations. "
-                "Each (from, to, label) must be unique "
-                "(or (from, to) when no label column is selected).\n\n"
-                "Examples:\n- " + "\n- ".join(examples)
-            )
-            st.stop()
+        # v0.93: mark only later duplicates
+        seen_keys: set = set()
 
-        # Build preview with existence check using related_objects + relations/{id}
         rows = []
         for rr in resolved_rows:
             f_id = rr["from_id"]; t_id = rr["to_id"]; lbl = rr["label"]; life = rr["lifecycle"]
@@ -1089,8 +1095,11 @@ def relationships_flow():
             if not tpl_id: errs.append("Template ID missing")
             missing_ft = (not f_id) or (not t_id)
 
+            key = (f_id, t_id) if label_col == "(none)" else (f_id, t_id, lbl)
+            is_dup_later = (not missing_ft) and (key in seen_keys)
+
             exists = False
-            if not missing_ft and not errs:
+            if not missing_ft and not errs and not is_dup_later:
                 try:
                     exists = relation_exists_exact(
                         template_id=str(tpl_id).strip(),
@@ -1101,10 +1110,16 @@ def relationships_flow():
                 except Exception:
                     exists = False
 
-            if missing_ft:
+            if is_dup_later:
+                action = "Skip: duplicate"
+            elif missing_ft:
                 action = "Skip: missing object"
             else:
                 action = "Skip (exists)" if exists else "Create"
+
+            # After deciding action, remember we've seen this key (so later same keys are dupes)
+            if not missing_ft:
+                seen_keys.add(key)
 
             rows.append({
                 "Action": action,
@@ -1128,11 +1143,19 @@ def relationships_flow():
                     bad = not str(row[col]).strip()
                 if col == "Error" and str(row[col]).strip():
                     bad = True
-                if str(row["Action"]).lower().startswith("skip"):
+
+                action_lower = str(row["Action"]).strip().lower()
+                is_skip = action_lower.startswith("skip")
+                is_create = action_lower == "create"
+
+                if is_skip:
                     styles.append("background-color:#efefef; color:#333; font-weight:600;")
                 else:
                     bg = "#a9f0a9" if not bad else "#ff9a9a"
-                    styles.append(f"background-color:{bg};")
+                    if is_create:
+                        styles.append(f"background-color:{bg}; color:#333;")
+                    else:
+                        styles.append(f"background-color:{bg};")
             return styles
 
         st.dataframe(rel_prev.style.apply(lambda r: style_row(r), axis=1), use_container_width=True)
@@ -1155,7 +1178,7 @@ def relationships_flow():
 
         for i, row in to_create.reset_index(drop=True).iterrows():
             try:
-                res = post_relationship(
+                _ = post_relationship(
                     template_id=str(row["Template_ID"]).strip(),
                     from_id=str(row["From_ID"]).strip(),
                     to_id=str(row["To_ID"]).strip(),
@@ -1181,7 +1204,6 @@ def relationships_flow():
             st.markdown("\n".join(lines))
 
 # ---------------- Main router ----------------
-# Guard at the top-level: show a friendly message before any API calls happen.
 if not tenant or not api_key:
     st.info("Enter **Tenant** and **API key** in the sidebar to begin.")
 else:
