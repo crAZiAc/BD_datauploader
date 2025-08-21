@@ -1,5 +1,6 @@
 # BD_Data_Uploader_v0_93.py
 # Streamlit app to upload/update BlueDolphin objects + create relationships
+# This software is under an MIT License (see root of project)
 # v0.93:
 #   - Relationships preview: keep the FIRST (from_id,to_id[,label]) and mark all later
 #     duplicates as "Skip: duplicate". First one still checks/obeys "Skip (exists)" and
@@ -1211,3 +1212,4 @@ else:
         objects_flow()
     else:
         relationships_flow()
+
