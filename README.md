@@ -1,7 +1,8 @@
 # BDdatauploader
 
 This project provides tools to upload and explore data in BlueDolphin using its public API.  
-The main application is built with [Streamlit](https://streamlit.io).
+The main application is built with [Streamlit](https://streamlit.io) and running on a community edition: 
+    https://bd-datauploader.streamlit.app/
 
 ## License
 This project is licensed under the MIT License. See the MIT License.txt file for details.
