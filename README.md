@@ -41,7 +41,7 @@ This project is licensed under the MIT License. See the MIT License.txt file for
 
 4. Run the Streamlit app:
 
-   streamlit run app.py
+   streamlit run BD_Data_Uploader.py
 
 5. Open the URL shown in the terminal (usually http://localhost:8501) in your browser.
 
