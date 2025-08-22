@@ -16,29 +16,35 @@ This project is licensed under the MIT License. See the MIT License.txt file for
 
 ### Prerequisites
 - Python 3.9+
-- [Streamlit](https://docs.streamlit.io/library/get-started/installation)
+- Streamlit
 
 ### Setup with virtual environment
+
 1. Clone the repository and check out the branch you want to test:
-   
+
    git fetch origin <branch-name>
    git checkout <branch-name>
 
-Create and activate a virtual environment:
+2. Create and activate a virtual environment:
 
-  python -m venv venv
-  # On Linux/macOS:
-  source venv/bin/activate
-  # On Windows (PowerShell):
-  venv\Scripts\Activate.ps1
+   Linux/macOS:
+     python -m venv venv
+     source venv/bin/activate
 
-Install dependencies:
+   Windows (PowerShell):
+     python -m venv venv
+     venv\Scripts\Activate.ps1
 
-  pip install -r requirements.txt
+3. Install dependencies:
 
-Run the Streamlit app:
+   pip install -r requirements.txt
 
-  streamlit run app.py
-  Replace app.py with the entrypoint file of the Streamlit app if different.
+4. Run the Streamlit app:
 
-Open the URL shown in the terminal (usually http://localhost:8501) in your browser.
+   streamlit run app.py
+
+5. Open the URL shown in the terminal (usually http://localhost:8501) in your browser.
+
+---
+
+Happy uploading!
