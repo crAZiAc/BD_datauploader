@@ -28,8 +28,15 @@ st.title("BlueDolphin CSV/Excel Uploader")
 # ---------------- Sidebar: connection + mode ----------------
 with st.sidebar:
     st.header("Connection")
-    region = st.selectbox("Region", ["EU", "US"], index=0)
-    API_BASE = "https://public-api.eu.bluedolphin.app/v1" if region == "EU" else "https://public-api.us.bluedolphin.app/v1"
+    region = st.selectbox("Region", ["EU", "US", "DEV03"], index=0)
+    
+    API_BASE = (
+        "https://public-api.eu.bluedolphin.app/v1" if region == "EU"
+        else "https://public-api.us.bluedolphin.app/v1" if region == "US"
+        else "https://bd-public-api.dev03.bd-cloud.app/v1" if region == "DEV03"
+        else "https://public-api.eu.bluedolphin.app/v1"
+    )
+
     tenant = st.text_input("Tenant", placeholder="mytenant")
     api_key = st.text_input("x-api-key", type="password")
 
